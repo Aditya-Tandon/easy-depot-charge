@@ -42,7 +42,7 @@ If a van cannot reach its target, it still gets as much charge as possible, and 
 
 ## How driver notes are handled
 
-1. The note is sent to an LLM (Claude Sonnet via Runware) that returns a list of changes as JSON: van, field, new value, and a quote from the note.
+1. The note is sent to an LLM (Gemini 3.1 Flash-Lite via Runware; set `RUNWARE_MODEL` to change it) that returns a list of changes as JSON: van, field, new value, and a quote from the note.
 2. Allowed fields: arrival time, departure time, arrival charge, target charge.
 3. The JSON is checked against a strict schema (pydantic). Anything malformed is rejected.
 4. Each change then gets one validation pass:

@@ -29,7 +29,7 @@ from app.models import Proposal, Session, Vehicle
 LONDON = ZoneInfo("Europe/London")  # same as app.seed.LONDON (not imported: avoids pulling in app.db)
 
 RUNWARE_URL = "https://api.runware.ai/v1"
-RUNWARE_MODEL = os.environ.get("RUNWARE_MODEL", "anthropic-claude-sonnet-4-6")
+RUNWARE_MODEL = os.environ.get("RUNWARE_MODEL", "google:gemini@3.1-flash-lite")  # benchmarked: p95 1.6s, 100% acc, ~11x cheaper than Sonnet 4.6
 RUNWARE_TIMEOUT_S = 60.0
 
 ALLOWED_FIELDS = ("arrival_at", "departure_at", "arrival_soc", "target_soc")
@@ -116,7 +116,10 @@ def call_runware(text: str, vehicle_names: list[str], client: httpx.Client | Non
     own = client is None
     client = client or httpx.Client(timeout=RUNWARE_TIMEOUT_S)
     try:
-        r = client.post(RUNWARE_URL, json=body, headers=headers, timeout=RUNWARE_TIMEOUT_S)
+        try:
+            r = client.post(RUNWARE_URL, json=body, headers=headers, timeout=RUNWARE_TIMEOUT_S)
+        except httpx.ConnectError:  # one retry on a transient connect/SSL failure
+            r = client.post(RUNWARE_URL, json=body, headers=headers, timeout=RUNWARE_TIMEOUT_S)
     except httpx.TimeoutException as e:
         raise RunwareError(f"Runware request timed out after {RUNWARE_TIMEOUT_S:.0f}s") from e
     except httpx.HTTPError as e:
