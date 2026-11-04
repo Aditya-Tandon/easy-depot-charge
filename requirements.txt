@@ -1,11 +1,12 @@
-fastapi
-jinja2
-python-multipart
-sqlmodel
-psycopg[binary]
-httpx
-pydantic
-scipy
-numpy
-python-dotenv
-tzdata
+# Runtime dependencies, pinned to the versions tested in the `algosoup` env.
+fastapi==0.162.0
+jinja2==3.1.6
+python-multipart==0.0.33
+sqlmodel==0.0.48
+psycopg[binary]==3.3.8
+httpx==0.28.1
+pydantic==2.14.2
+scipy==1.17.1
+numpy==2.4.6
+python-dotenv==1.2.4
+tzdata>=2024.1  # IANA tz database for zoneinfo on Linux images without system tzdata

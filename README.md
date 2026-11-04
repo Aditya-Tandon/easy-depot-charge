@@ -57,7 +57,7 @@ If a van cannot reach its target, it still gets as much charge as possible, and 
 
 ```bash
 conda activate algosoup
-pip install -r requirements.txt
+pip install -r requirements-dev.txt   # runtime deps + pytest + uvicorn
 ```
 
 Set `DATABASE_URL` and `RUNWARE_API_KEY` in `~/.env` or the environment (see `.env.example`). Without `DATABASE_URL` the app falls back to a local SQLite file.
@@ -108,4 +108,18 @@ Data sources: if Octopus has no price for a slot, a fallback price curve is used
 - **Routing vans between depots.** Assign each van to the depot that best fits tomorrow's first job, given charger capacity and local prices. This is a joint assignment and charging problem.
 - **Live charger data.** Use real charger readings instead of planned values, and re-plan during the night.
 - **Logins for several managers**, with a record of who accepted or published what.
-- **Alerts** when the next day's Agile prices are published (around 16:00), so the plan can be run straight away.
+- **Alerts** when the next day's Agile prices are published (Octopus usually publishes the next day's Agile rates in the late afternoon), so the plan can be run straight away.
+
+## Known issues
+
+These came out of a code-quality review at the end of the build. They are not fixed yet.
+
+- **No login and no CSRF protection.** Every action (refresh prices, optimise, publish, suggest changes, accept or reject) is a plain POST with no auth. Another website could trigger them, and repeated calls spend Runware and price-API quota. There is no rate limit. Fine for a demo; add a login or at least a same-origin check before real use.
+- **Database outages are not handled.** Price and LLM outages are tested and fail safely, but if Neon is down the page returns a server error. There are no tests for it.
+- **Two routes can still error.** `make_plan` in `app/main.py` assumes a site exists and that every half-hour has a price after a refresh (a missing slot raises `KeyError`). Accepting a suggestion converts the stored value without a guard.
+- **Duplicated time helpers.** A UTC helper is defined in `app/main.py`, `app/ingest.py` and `app/llm.py` (with slightly different behaviour), and `LONDON` is defined in `app/ingest.py`, `app/llm.py` and `app/seed.py`. They should live in one module so they cannot drift apart.
+- **`index()` in `app/main.py` does too much.** It runs the queries, works out whether the plan is stale and builds the chart data in one function. Moving that into a separate, testable module would help.
+- **Thin app-level tests.** `tests/test_app.py` has one end-to-end test, and it checks page wording, so copy changes break it. Publishing, rejecting, conflicting accepts and the stale-plan warning are not tested over HTTP. The SQLite fixture is copied across three test files instead of living in a `conftest.py`.
+- **Schema changes are manual.** Tables are created with `create_all`; the `plan.baseline_load_json` column was added by hand with `ALTER TABLE`. There are no migrations.
+- **Local runs use the production database.** `app/db.py` loads `~/.env`, so running locally with that file points at the live Neon database. A missing `DATABASE_URL` falls back to a local SQLite file, which will not work on Vercel.
+- **Small optimiser and LLM edge cases.** A site-limit shortfall under 0.05 kWh is left out of the reason text (the delivered figure still shows it). Fairness spreads the worst shortfall evenly, but vans better off than the worst one are split by cost. A charge suggestion within 0.5 percentage points of the current value counts as "no change". The 24-hour limit on departures is measured in real time, so it behaves slightly differently on clock-change nights.
