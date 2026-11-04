@@ -1,0 +1,11 @@
+fastapi
+jinja2
+python-multipart
+sqlmodel
+psycopg[binary]
+httpx
+pydantic
+scipy
+numpy
+python-dotenv
+tzdata

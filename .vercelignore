@@ -1,0 +1,6 @@
+.env
+local.db
+tests/
+.pytest_cache
+__pycache__
+.env.local

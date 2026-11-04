@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Overnight Charging Planner</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+  <style>
+    :root { --pico-font-size: 15px; }
+    .grid-wrap { overflow-x: auto; }
+    table.slots { font-size: 12px; border-collapse: collapse; }
+    table.slots th, table.slots td { padding: 2px 3px; text-align: center; min-width: 30px; white-space: nowrap; }
+    table.slots th:first-child, table.slots td:first-child { text-align: left; position: sticky; left: 0; background: var(--pico-background-color); }
+    .cell-on { color: #fff; font-weight: 600; }
+    .muted { color: var(--pico-muted-color); }
+    .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 1rem; }
+    .kpis article { margin: 0; padding: 1rem; }
+    .kpis strong { font-size: 1.5rem; display: block; }
+    .bad { color: #b42318; }
+    .good { color: #067647; }
+    .tag { font-size: 11px; padding: 1px 6px; border-radius: 8px; background: #eef; }
+    .tag.invalid, .tag.rejected { background: #fde8e8; }
+    .tag.accepted, .tag.published { background: #e3f6ea; }
+    form.inline { display: inline; margin: 0; }
+    form.inline button { padding: 2px 10px; font-size: 12px; margin: 0; width: auto; }
+  </style>
+</head>
+<body>
+<main class="container">
+  <hgroup>
+    <h1>Tonight's charging plan</h1>
+    <p>{{ site.name }} · {{ date.strftime("%a %d %b %Y") }} · site limit <b>{{ site.site_limit_kw|round(0)|int }} kW</b> · charger efficiency η {{ eta }}</p>
+  </hgroup>
+
+  {# ---------- KPIs ---------- #}
+  <section class="kpis">
+    {% if plan %}
+      {% set saving = plan.baseline_cost_gbp - plan.cost_gbp %}
+      <article><span class="muted">Optimised cost</span><strong>£{{ "%.2f"|format(plan.cost_gbp) }}</strong></article>
+      <article><span class="muted">Charge-on-arrival baseline</span><strong>£{{ "%.2f"|format(plan.baseline_cost_gbp) }}</strong></article>
+      <article><span class="muted">Saving tonight</span><strong class="{{ 'good' if saving >= 0 else 'bad' }}">£{{ "%.2f"|format(saving) }}
+        {% if plan.baseline_cost_gbp > 0 %}<small>({{ (100*saving/plan.baseline_cost_gbp)|round(0)|int }}%)</small>{% endif %}</strong></article>
+      {% if plan.carbon_kg is not none %}
+      <article><span class="muted">CO₂ plan vs baseline</span><strong>{{ plan.carbon_kg|round(1) }} / {{ plan.baseline_carbon_kg|round(1) }} kg</strong></article>
+      {% endif %}
+    {% else %}
+      <article><span class="muted">No plan yet</span><strong>Run the optimiser ↓</strong></article>
+    {% endif %}
+  </section>
+
+  {# ---------- actions ---------- #}
+  <section style="margin-top:1rem">
+    <div role="group">
+      <form method="post" action="/prices/refresh" class="inline"><button class="secondary outline">↻ Refresh prices &amp; carbon</button></form>
+      <form method="post" action="/plan" class="inline"><button>⚡ Optimise (new draft)</button></form>
+      {% if plan and plan.status == "draft" %}
+      <form method="post" action="/plan/{{ plan.id }}/publish" class="inline"><button class="contrast">✓ Publish rev {{ plan.revision }}</button></form>
+      {% endif %}
+    </div>
+    <p class="muted">
+      {% if plan %}Showing <b>revision {{ plan.revision }}</b> <span class="tag {{ plan.status }}">{{ plan.status }}</span> · created {{ plan.created_at|local }}.{% endif %}
+      {% if published %} Published plan: rev {{ published.revision }}.{% else %} Nothing published yet tonight.{% endif %}
+    </p>
+  </section>
+
+  {# ---------- infeasible vans ---------- #}
+  {% set short = outcomes.values()|selectattr("infeasible_reason")|list %}
+  {% if short %}
+  <article style="border-left:4px solid #b42318">
+    <b>{{ short|length }} van{{ 's' if short|length > 1 }} won't reach target</b>
+    <ul style="margin-bottom:0">
+      {% for o in short %}<li><b>{{ names[o.vehicle_id] }}</b>: {{ o.infeasible_reason }}</li>{% endfor %}
+    </ul>
+  </article>
+  {% endif %}
+
+  {# ---------- slot grid: prices, carbon, per-van allocation ---------- #}
+  <section>
+    <h2>Half-hourly plan <small class="muted">(kW per van; London time)</small></h2>
+    {% if n_fallback %}<p class="muted">⚠ {{ n_fallback }} of {{ prices|length }} price slots use a fallback curve (Agile not yet published for those times).</p>{% endif %}
+    {% if not prices %}<p class="muted">No prices loaded yet: click <b>Refresh prices</b>.</p>{% endif %}
+    <div class="grid-wrap">
+    <table class="slots">
+      <thead><tr><th></th>{% for s in slots %}<th>{{ s|local }}</th>{% endfor %}</tr></thead>
+      <tbody>
+        <tr><td>Price p/kWh</td>
+          {% for p in prices %}
+            <td style="background: rgba({{ '220,60,40' if p.price_p_per_kwh >= 0 else '30,140,80' }}, {{ (0.08 + 0.6*(p.price_p_per_kwh|abs)/max_price)|round(2) }})"
+                title="{{ p.source }} · {{ p.source_url }}">{{ p.price_p_per_kwh|round(1) }}{% if p.source != 'octopus' %}*{% endif %}</td>
+          {% endfor %}</tr>
+        <tr><td>Carbon g/kWh</td>
+          {% for p in prices %}
+            <td style="background: rgba(110,110,110,{{ (0.05 + 0.5*(p.carbon_g_per_kwh or 0)/max_carbon)|round(2) }})">{{ p.carbon_g_per_kwh|int if p.carbon_g_per_kwh is not none else "–" }}</td>
+          {% endfor %}</tr>
+        {% for v, s in rows %}
+        <tr><td>{{ v.name }}</td>
+          {% for t in slots %}
+            {% set kw = grid.get((v.id, t), 0) %}
+            {% set plugged = s.arrival_at <= t and t < s.departure_at %}
+            {% if kw > 0 %}<td class="cell-on" style="background: rgba(37,99,235,{{ (0.25 + 0.75*kw/v.max_charge_kw)|round(2) }})">{{ kw|round(0)|int }}</td>
+            {% elif plugged %}<td style="background:#f1f4fa">·</td>
+            {% else %}<td></td>{% endif %}
+          {% endfor %}</tr>
+        {% endfor %}
+        {% if plan %}
+        <tr><td><b>Site load</b></td>
+          {% for t in slots %}<td class="{{ 'bad' if load[t] > site.site_limit_kw + 0.01 }}"><b>{{ load[t]|round(0)|int }}</b></td>{% endfor %}</tr>
+        {% endif %}
+      </tbody>
+    </table>
+    </div>
+    <p class="muted"><small>Blue = charging (darker = closer to max rate) · light grey = plugged in, idle · * = fallback price. Hover a price for its source.</small></p>
+  </section>
+
+  {# ---------- vans ---------- #}
+  <section>
+    <h2>Vans tonight</h2>
+    <table class="striped">
+      <thead><tr><th>Van</th><th>Battery</th><th>Max kW</th><th>Arrives</th><th>Departs</th><th>SoC in → target</th><th>Need</th><th>Planned</th></tr></thead>
+      <tbody>
+      {% for v, s in rows %}
+        {% set o = outcomes.get(v.id) %}
+        <tr>
+          <td>{{ v.name }}</td><td>{{ v.battery_kwh|int }} kWh</td><td>{{ v.max_charge_kw|int }}</td>
+          <td>{{ s.arrival_at|local }}</td><td>{{ s.departure_at|local }}</td>
+          <td>{{ (s.arrival_soc*100)|round(0)|int }}% → {{ (s.target_soc*100)|round(0)|int }}%</td>
+          <td>{{ ((s.target_soc - s.arrival_soc) * v.battery_kwh)|round(1) }} kWh</td>
+          <td>{% if o %}<span class="{{ 'bad' if o.infeasible_reason else 'good' }}">{{ o.delivered_kwh|round(1) }} kWh</span>{% else %}–{% endif %}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </section>
+
+  {# ---------- LLM proposals ---------- #}
+  <section>
+    <h2>Driver / dispatcher updates</h2>
+    <form method="post" action="/proposals">
+      <textarea name="text" rows="3" placeholder="e.g. Van 03 stuck on the A40, now arriving about 23:30 with 20% left. Van 07 needs to be full by 05:00." required></textarea>
+      <button type="submit" class="secondary">Extract proposed changes (LLM)</button>
+    </form>
+    {% if proposals %}
+    <table>
+      <thead><tr><th>Van</th><th>Field</th><th>Proposed value</th><th>Evidence (quote)</th><th>Status</th><th></th></tr></thead>
+      <tbody>
+      {% for p in proposals %}
+        <tr>
+          <td>{{ names.get(p.vehicle_id, "–") }}</td>
+          <td>{{ p.field or "–" }}</td>
+          <td>{% if p.value and p.field and p.field.endswith("_at") %}{{ p.value|isolocal }}{% elif p.value %}{{ ((p.value|float)*100)|round(0)|int }}%{% else %}–{% endif %}</td>
+          <td><i>{{ ('"' ~ p.quote ~ '"') if p.quote else "" }}</i>{% if p.error %}<br><small class="bad">{{ p.error }}</small>{% endif %}</td>
+          <td><span class="tag {{ p.status }}">{{ p.status }}</span></td>
+          <td>{% if p.status == "pending" %}
+            <form method="post" action="/proposals/{{ p.id }}/accept" class="inline"><button>Accept</button></form>
+            <form method="post" action="/proposals/{{ p.id }}/reject" class="inline"><button class="secondary outline">Reject</button></form>
+          {% endif %}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    <p class="muted"><small>Accepted changes update tonight's sessions. Re-run <b>Optimise</b> to get a new draft revision.</small></p>
+    {% endif %}
+  </section>
+</main>
+</body>
+</html>

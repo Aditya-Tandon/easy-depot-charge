@@ -1,0 +1,8 @@
+.env
+__pycache__/
+.pytest_cache/
+local.db
+.vercel
+.env*
+.DS_Store
+!.env.example
