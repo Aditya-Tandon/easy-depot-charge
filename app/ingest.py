@@ -13,16 +13,23 @@ Sources
 Any half hour without an Octopus price gets a synthetic price from
 ``fallback_price`` (source="fallback"); missing carbon is ``None``. Network
 errors, timeouts, non-200 responses and malformed JSON never propagate: they
-just mean that source contributed nothing.
+just mean that source contributed nothing. A single bad row (non-numeric or
+non-finite value, bad timestamp) is skipped on its own and doesn't void the rest.
+
+A rate is only applied to half-hour slots it *fully* covers: a rate whose
+valid_from/valid_to are off the half hour never prices a slot it only partly
+covers (that slot falls back instead of getting a possibly wrong price).
 """
 from __future__ import annotations
 
 import logging
+import math
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Iterable, Optional
 from zoneinfo import ZoneInfo
 
 import httpx
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm.attributes import set_committed_value
 from sqlmodel import Session, select
 
@@ -72,6 +79,17 @@ def _slot_starts(start: datetime, end: datetime) -> list[datetime]:
         out.append(t)
         t += SLOT
     return out
+
+
+def _finite_float(v: Any) -> Optional[float]:
+    """float(v) if v is a finite number (or numeric string), else None. bools are rejected."""
+    if isinstance(v, bool):
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return f if math.isfinite(f) else None
 
 
 def _iso_z(dt: datetime) -> str:
@@ -195,18 +213,21 @@ def _fetch_octopus(client: httpx.Client, slots: list[datetime]) -> tuple[dict[da
     preferred: dict[datetime, bool] = {}
     for rate in _paginate(client, url):
         try:
-            value = float(rate["value_inc_vat"])
+            value = _finite_float(rate["value_inc_vat"])
             frm = _parse_ts(rate["valid_from"])
             to = _parse_ts(rate["valid_to"]) if rate.get("valid_to") else slots[-1] + SLOT
-        except (KeyError, ValueError, TypeError):
+        except (KeyError, ValueError, TypeError, AttributeError):
+            continue
+        if value is None:  # nan / inf / non-numeric: ignore, so the slot falls back
             continue
         # Some tariffs list separate DIRECT_DEBIT / NON_DIRECT_DEBIT rates; prefer DD (or untagged).
         pref = rate.get("payment_method") in (None, "DIRECT_DEBIT")
-        # A rate may span several half hours: expand it onto each slot it covers.
+        # A rate may span several half hours: expand it onto each slot it *fully* covers
+        # (an unaligned edge never prices a slot it only partly covers).
         t = _floor_slot(frm)
         if t < frm:
             t += SLOT
-        while t < to and t <= slots[-1]:
+        while t + SLOT <= to and t <= slots[-1]:
             if t in wanted and (t not in prices or (pref and not preferred[t])):
                 prices[t] = value
                 preferred[t] = pref
@@ -242,12 +263,13 @@ def _fetch_carbon(client: httpx.Client, slots: list[datetime]) -> dict[datetime,
     for row in region.get("data") or []:
         try:
             t = _parse_ts(row["from"])
-            forecast = row["intensity"]["forecast"]
-        except (KeyError, TypeError, ValueError):
+            forecast = _finite_float(row["intensity"]["forecast"])
+        except (KeyError, TypeError, ValueError, AttributeError):
             continue
         # The API also returns the half hour ending at `from`; only keep requested slots.
+        # A bad forecast (None, "n/a", nan) only leaves its own slot without carbon.
         if t in wanted and forecast is not None:
-            out[t] = float(forecast)
+            out[t] = forecast
     return out
 
 
@@ -301,17 +323,12 @@ def _normalise_row(row: PriceSlot) -> PriceSlot:
     return row
 
 
-def refresh_prices(db: Session, start: datetime, end: datetime,
-                   client: Optional[httpx.Client] = None) -> list[PriceSlot]:
-    """fetch_slots + upsert by start_at, commit, and return the saved rows sorted by start_at.
+def _upsert(db: Session, fresh: list[PriceSlot]) -> list[PriceSlot]:
+    """Select existing rows for the window, insert/update from ``fresh``, commit. Returns saved rows.
 
-    Existing rows are updated in place. One exception: a fallback value never overwrites an
-    existing Octopus price (a transient outage shouldn't erase real prices), and a missing
-    carbon forecast never blanks a stored one.
+    New rows are inserted as copies, so ``fresh`` stays untouched if the commit fails and the
+    caller can retry with it.
     """
-    fresh = fetch_slots(start, end, client)
-    if not fresh:
-        return []
     lo, hi = fresh[0].start_at, fresh[-1].start_at
     existing = {
         _utc(r.start_at): r
@@ -321,8 +338,11 @@ def refresh_prices(db: Session, start: datetime, end: datetime,
     for s in fresh:
         row = existing.get(s.start_at)
         if row is None:
-            db.add(s)
-            saved.append(s)
+            new = PriceSlot(start_at=s.start_at, price_p_per_kwh=s.price_p_per_kwh,
+                            carbon_g_per_kwh=s.carbon_g_per_kwh, source=s.source,
+                            source_url=s.source_url, fetched_at=s.fetched_at)
+            db.add(new)
+            saved.append(new)
             continue
         if s.source == "fallback" and row.source == "octopus":
             if s.carbon_g_per_kwh is not None:
@@ -338,6 +358,32 @@ def refresh_prices(db: Session, start: datetime, end: datetime,
         db.add(row)
         saved.append(row)
     db.commit()
+    return saved
+
+
+def refresh_prices(db: Session, start: datetime, end: datetime,
+                   client: Optional[httpx.Client] = None) -> list[PriceSlot]:
+    """fetch_slots + upsert by start_at, commit, and return the saved rows sorted by start_at.
+
+    Existing rows are updated in place. One exception: a fallback value never overwrites an
+    existing Octopus price (a transient outage shouldn't erase real prices), and a missing
+    carbon forecast never blanks a stored one.
+
+    Concurrency: the upsert is select-then-insert, so an overlapping refresh can insert the
+    same start_at first and trip the unique index at commit. That IntegrityError is handled by
+    rolling back and retrying the upsert once, re-reading existing rows (the racing rows are
+    then updated in place). Note the rollback also discards any other uncommitted changes in
+    ``db``. A second consecutive conflict is re-raised.
+    """
+    fresh = fetch_slots(start, end, client)
+    if not fresh:
+        return []
+    try:
+        saved = _upsert(db, fresh)
+    except IntegrityError:
+        log.warning("PriceSlot upsert hit a unique conflict (concurrent refresh?); retrying once")
+        db.rollback()
+        saved = _upsert(db, fresh)
     for row in saved:
         db.refresh(row)
         _normalise_row(row)

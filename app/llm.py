@@ -14,6 +14,7 @@ import json
 import os
 import re
 import uuid
+from dataclasses import dataclass, field as dc_field
 from datetime import date as Date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Literal
@@ -80,7 +81,8 @@ Rules:
 - One proposal per (vehicle, field) change. One sentence may yield several proposals.
 - "quote" must be copied VERBATIM (exact characters, a contiguous span) from the user's note and must be the part that states this change. Never paraphrase or fix typos in the quote.
 - Only propose changes the note actually states. Approximate values ("about 23:30", "maybe 20%") are fine: use the stated number. Do not invent values.
-- If nothing in the note maps to these fields, output {{"proposals": []}}."""
+- Do not propose a value the note says is unchanged or already in place ("as planned", "still 05:00").
+- If nothing in the note changes tonight's sessions, output {{"proposals": []}}. An empty list is a normal, correct answer (e.g. for "all vans as planned" or an unrelated note)."""
 
 
 def _api_key() -> str:
@@ -196,20 +198,52 @@ def _utc(dt: datetime) -> datetime:
 _HHMM = re.compile(r"^\s*(\d{1,2}):(\d{2})\s*$")
 
 
-def _parse_time(field: str, value: str, d: Date) -> datetime:
+def _hhmm(field: str, value: str) -> time:
     m = _HHMM.match(value)
     if not m:
         raise ValueError(f"{field} value '{value}' is not a 24h HH:MM time")
     h, mi = int(m.group(1)), int(m.group(2))
     if h > 23 or mi > 59:
         raise ValueError(f"{field} value '{value}' is not a valid time")
-    # Session.date is the evening the session starts. Afternoon/evening times belong to that
-    # date; early-morning times to the next day. (Same rule for both fields.)
-    day = d if h >= 12 else d + timedelta(days=1)
-    out = datetime.combine(day, time(h, mi), tzinfo=LONDON).astimezone(timezone.utc)
-    if out.astimezone(LONDON).time() != time(h, mi):  # e.g. 01:30 on the spring-forward night
+    return time(h, mi)
+
+
+def _local(field: str, value: str, day: Date, t: time) -> datetime:
+    """London `t` on `day`, as UTC; rejects times that do not exist on that day."""
+    out = datetime.combine(day, t, tzinfo=LONDON).astimezone(timezone.utc)
+    if out.astimezone(LONDON).time() != t:  # e.g. 01:30 on the spring-forward night
         raise ValueError(f"{field} value '{value}' does not exist on {day} (clock change)")
     return out
+
+
+def _parse_time(field: str, value: str, d: Date) -> datetime:
+    """Arrival rule. Session.date is the evening the session starts: afternoon/evening times
+    belong to that date, early-morning times to the next day."""
+    t = _hhmm(field, value)
+    return _local(field, value, d if t.hour >= 12 else d + timedelta(days=1), t)
+
+
+MAX_DWELL = timedelta(hours=24)
+
+
+def _resolve_departure(value: str, d: Date, arrival: datetime) -> datetime | None:
+    """Departure rule: the earliest of {d, d+1} at that London time that is strictly after
+    `arrival` and less than 24h after it (so a late-shift "13:00" is the next afternoon).
+    None if neither qualifies; raises ValueError for a bad value, or if the only candidate in
+    range falls in a clock-change gap."""
+    t = _hhmm("departure_at", value)
+    gap: ValueError | None = None
+    for day in (d, d + timedelta(days=1)):
+        try:
+            dt = _local("departure_at", value, day, t)
+        except ValueError as e:
+            gap = gap or e
+            continue
+        if arrival < dt and dt - arrival < MAX_DWELL:
+            return dt
+    if gap:
+        raise gap
+    return None
 
 
 _NUM = re.compile(r"^\s*(\d+(?:\.\d+)?|\.\d+)\s*(%?)\s*$")
@@ -237,56 +271,103 @@ def _fmt(dt: datetime) -> str:
     return dt.astimezone(LONDON).strftime("%H:%M")
 
 
-def _check(p: ProposalLLM, raw_text: str, vehicles: list[Vehicle],
-           sessions: dict[int, Session], out: Proposal) -> str | None:
-    """Fill `out` with normalised values; return the first error message, or None if valid."""
+@dataclass
+class _Running:
+    """A van's session as it stands after the valid proposals seen so far in this note."""
+    name: str
+    arrival_at: datetime  # UTC
+    departure_at: datetime  # UTC
+    arrival_soc: float
+    target_soc: float
+    src: dict[str, int] = dc_field(default_factory=dict)  # field -> 1-based proposal number that set it
+
+    @classmethod
+    def of(cls, v: Vehicle, s: Session) -> "_Running":
+        return cls(v.name, _utc(s.arrival_at), _utc(s.departure_at), s.arrival_soc, s.target_soc)
+
+    def earlier(self, f: str, shown: str) -> str:
+        """Suffix naming the earlier proposal in this note that set field `f`, if any."""
+        n = self.src.get(f)
+        return f"; conflicts with earlier proposal {n} in this note ({self.name} {f} = {shown})" if n else ""
+
+
+def _check(p: ProposalLLM, raw_text: str, vehicles: list[Vehicle], sessions: dict[int, Session],
+           running: dict[int, _Running], seen: dict[tuple[int, str], int], n: int,
+           out: Proposal) -> tuple[str | None, object]:
+    """Fill `out` with normalised values; return (first error or None, normalised new value).
+
+    `running` holds each van's session after the earlier valid proposals in this batch; `seen`
+    maps (vehicle_id, field) -> number of the first proposal in this batch that targeted it.
+    """
     # a. vehicle
     v, err = _resolve_vehicle(p.vehicle, vehicles)
     if err:
-        return err
+        return err, None
     out.vehicle_id = v.id
     # b. session
     s = sessions.get(v.id)
     if s is None:
-        return f"{v.name} has no session for this date"
-    # c. value
+        return f"{v.name} has no session for this date", None
+    r = running.setdefault(v.id, _Running.of(v, s))
+    # c. one change per (van, field) per note
+    first = seen.get((v.id, p.field))  # only VALID earlier proposals count (recorded on success)
+    if first is not None:
+        return f"duplicate: {v.name} {p.field} was already proposed earlier in this note (proposal {first})", None
+    # d. value
     try:
-        if p.field in TIME_FIELDS:
-            new_dt = _parse_time(p.field, p.value, s.date)
-            out.value = new_dt.isoformat()
+        if p.field == "departure_at":
+            new = _resolve_departure(p.value, s.date, r.arrival_at)
+            if new is None:
+                return (f"departure {_hhmm(p.field, p.value):%H:%M} is not within 24h after arrival "
+                        f"{_fmt(r.arrival_at)} for {v.name} (London time)"
+                        f"{r.earlier('arrival_at', _fmt(r.arrival_at))}"), None
+            out.value = new.isoformat()
+        elif p.field == "arrival_at":
+            new = _parse_time(p.field, p.value, s.date)
+            out.value = new.isoformat()
         else:
-            new_soc = _parse_soc(p.field, p.value)
-            out.value = repr(new_soc)
+            new = _parse_soc(p.field, p.value)
+            out.value = repr(new)
     except ValueError as e:
-        return str(e)
-    # d. consistency with the rest of the session (proposed value replaces the current one)
+        return str(e), None
+    # e. no-op: the value must differ from the (running) session's current one
+    cur = getattr(r, p.field)
     if p.field in TIME_FIELDS:
-        arr = new_dt if p.field == "arrival_at" else _utc(s.arrival_at)
-        dep = new_dt if p.field == "departure_at" else _utc(s.departure_at)
+        if new.replace(second=0, microsecond=0) == cur.replace(second=0, microsecond=0):
+            return f"no change: {v.name} {p.field} is already {_fmt(cur)}", None
+    elif abs(new - cur) <= 0.005 + 1e-9:
+        return f"no change: {v.name} {p.field} is already {cur:.0%}", None
+    # f. consistency with the rest of the (running) session: the proposed value replaces the current one
+    if p.field in TIME_FIELDS:
+        arr = new if p.field == "arrival_at" else r.arrival_at
+        dep = new if p.field == "departure_at" else r.departure_at
         if not arr < dep:
+            other = "departure_at" if p.field == "arrival_at" else "arrival_at"
             return (f"arrival {_fmt(arr)} would not be before departure {_fmt(dep)} "
-                    f"for {v.name} (London time)")
+                    f"for {v.name} (London time){r.earlier(other, _fmt(getattr(r, other)))}"), None
     else:
-        a = new_soc if p.field == "arrival_soc" else s.arrival_soc
-        t = new_soc if p.field == "target_soc" else s.target_soc
+        a = new if p.field == "arrival_soc" else r.arrival_soc
+        t = new if p.field == "target_soc" else r.target_soc
         if not t > a:
-            return f"target_soc {t:.0%} would not exceed arrival_soc {a:.0%} for {v.name}"
-    # e. quote grounding: verbatim, and it must actually evidence this change
+            other = "target_soc" if p.field == "arrival_soc" else "arrival_soc"
+            return (f"target_soc {t:.0%} would not exceed arrival_soc {a:.0%} for {v.name}"
+                    f"{r.earlier(other, f'{getattr(r, other):.0%}')}"), None
+    # g. quote grounding: verbatim, and it must actually evidence this change
     if not p.quote.strip() or _ws(p.quote) not in _ws(raw_text):
-        return f"quote '{p.quote}' does not appear in the original text"
+        return f"quote '{p.quote}' does not appear in the original text", None
     vnum = _digits(v.name)
     if vnum and vnum not in _nums(raw_text):
-        return f"{v.name} is not mentioned in the original text"
+        return f"{v.name} is not mentioned in the original text", None
     q, qnums = _ws(p.quote), _nums(p.quote)
     if p.field in TIME_FIELDS:
-        h = new_dt.astimezone(LONDON).hour
+        h = new.astimezone(LONDON).hour
         ok = str(h) in qnums or str(h % 12 or 12) in qnums or any(w in q for w in ("midnight", "noon"))
     else:
-        pct = str(round(new_soc * 100))
-        ok = pct in qnums or (new_soc == 1 and "full" in q) or (new_soc == 0 and "empty" in q)
+        pct = str(round(new * 100))
+        ok = pct in qnums or (new == 1 and "full" in q) or (new == 0 and "empty" in q)
     if not ok:
-        return f"quote '{p.quote}' does not support {p.field} = {p.value}"
-    return None
+        return f"quote '{p.quote}' does not support {p.field} = {p.value}", None
+    return None, new
 
 
 def _nums(s: str) -> set[str]:
@@ -295,7 +376,7 @@ def _nums(s: str) -> set[str]:
 
 def parse_and_validate(raw_text: str, llm_output: str, vehicles: list[Vehicle],
                        sessions: dict[int, Session], now: datetime | None = None) -> list[Proposal]:
-    """Parse the LLM output with pydantic and check each proposal once. Returns UNSAVED rows.
+    """Parse the LLM output with pydantic and check each proposal once, in order. Returns UNSAVED rows.
 
     `sessions` maps vehicle_id -> that vehicle's Session for the date being planned.
     """
@@ -306,16 +387,25 @@ def parse_and_validate(raw_text: str, llm_output: str, vehicles: list[Vehicle],
         return [Proposal(raw_text=raw_text, status="invalid", created_at=now,
                          error=f"LLM output failed schema validation: {_short_pydantic(e)}")]
 
+    # Proposals are checked in order against a running copy of each van's session: every valid
+    # proposal is applied to the copy, so later ones are judged against the note as a whole.
+    running: dict[int, _Running] = {}
+    seen: dict[tuple[int, str], int] = {}
     rows: list[Proposal] = []
-    for p in batch.proposals:
+    for n, p in enumerate(batch.proposals, start=1):
         row = Proposal(raw_text=raw_text, field=p.field, value=p.value, quote=p.quote,
                        status="pending", created_at=now)
         try:
-            err = _check(p, raw_text, vehicles, sessions, row)
+            err, new = _check(p, raw_text, vehicles, sessions, running, seen, n, row)
         except Exception as e:  # never let one bad proposal 500 the request
             err = f"could not validate proposal: {type(e).__name__}"
         if err:
             row.status, row.error = "invalid", err
+        else:
+            r = running[row.vehicle_id]
+            setattr(r, p.field, new)
+            r.src[p.field] = n
+            seen[(row.vehicle_id, p.field)] = n
         rows.append(row)
     return rows
 

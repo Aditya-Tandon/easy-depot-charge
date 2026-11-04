@@ -1,166 +1,357 @@
 <!doctype html>
 <html lang="en" data-theme="light">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Overnight Charging Planner</title>
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
-  <style>
-    :root { --pico-font-size: 15px; }
-    .grid-wrap { overflow-x: auto; }
-    table.slots { font-size: 12px; border-collapse: collapse; }
-    table.slots th, table.slots td { padding: 2px 3px; text-align: center; min-width: 30px; white-space: nowrap; }
-    table.slots th:first-child, table.slots td:first-child { text-align: left; position: sticky; left: 0; background: var(--pico-background-color); }
-    .cell-on { color: #fff; font-weight: 600; }
-    .muted { color: var(--pico-muted-color); }
-    .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 1rem; }
-    .kpis article { margin: 0; padding: 1rem; }
-    .kpis strong { font-size: 1.5rem; display: block; }
-    .bad { color: #b42318; }
-    .good { color: #067647; }
-    .tag { font-size: 11px; padding: 1px 6px; border-radius: 8px; background: #eef; }
-    .tag.invalid, .tag.rejected { background: #fde8e8; }
-    .tag.accepted, .tag.published { background: #e3f6ea; }
-    form.inline { display: inline; margin: 0; }
-    form.inline button { padding: 2px 10px; font-size: 12px; margin: 0; width: auto; }
-  </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Charging plan · {{ site.name }}</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+<style>
+  :root {
+    --pico-font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    --pico-font-size: 15px; --pico-spacing: .75rem;
+    --page: #f9f9f7; --surface: #fcfcfb; --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
+    --grid: #e1e0d9; --axis: #c3c2b7; --ring: rgba(11,11,11,.10);
+    --blue: #2a78d6; --orange: #eb6834; --aqua: #1baf7a;
+    --good: #0ca30c; --good-text: #006300; --critical: #d03b3b; --warning: #fab219;
+    --b1: #cde2fb; --b2: #86b6ef; --b3: #3987e5; --b4: #1c5cab; --idle: #f0efec;
+  }
+  body { background: var(--page); color: var(--ink); }
+  main.container { max-width: 1240px; padding-top: 1.25rem; }
+  h1, h2, h3 { color: var(--ink); margin-bottom: .25rem; }
+  h2 { font-size: 1.1rem; }
+  .muted { color: var(--ink-2); }
+  .small { font-size: .82rem; }
+  .card { background: var(--surface); border: 1px solid var(--ring); border-radius: 12px; padding: 1rem 1.1rem; margin-bottom: 1rem; }
+  header.top { display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem; flex-wrap: wrap; margin-bottom: 1rem; }
+  .eyebrow { font-size: .75rem; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); margin: 0; }
+  .pill { display: inline-flex; align-items: center; gap: .35rem; padding: .2rem .65rem; border-radius: 999px; font-size: .8rem; font-weight: 600; border: 1px solid var(--ring); background: #fff; white-space: nowrap; }
+  .pill .dot { width: 8px; height: 8px; border-radius: 50%; }
+  .steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: .75rem; }
+  .step { display: flex; flex-direction: column; gap: .4rem; }
+  .step .n { font-size: .72rem; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+  .step form { margin: 0; }
+  .step button { width: 100%; margin: 0; padding: .45rem .8rem; font-size: .9rem; }
+  .kpis { display: grid; grid-template-columns: repeat(4, 1fr); gap: .75rem; margin-bottom: 1rem; }
+  .kpi { background: var(--surface); border: 1px solid var(--ring); border-radius: 12px; padding: .85rem 1rem; }
+  .kpi .label { font-size: .8rem; color: var(--ink-2); }
+  .kpi .value { font-size: 1.6rem; font-weight: 650; line-height: 1.2; margin: .15rem 0; }
+  .kpi .sub { font-size: .8rem; color: var(--ink-2); }
+  .good-text { color: var(--good-text); } .bad-text { color: var(--critical); }
+  .banner { display: flex; gap: .6rem; align-items: flex-start; border-radius: 10px; padding: .7rem .9rem; margin-bottom: 1rem; border: 1px solid var(--ring); background: #fff; }
+  .banner.info { border-left: 4px solid var(--blue); }
+  .banner.warn { border-left: 4px solid var(--warning); }
+  .banner.crit { border-left: 4px solid var(--critical); }
+  .banner ul { margin: .3rem 0 0; padding-left: 1.1rem; } .banner li { margin: .1rem 0; }
+  /* charts */
+  .chart { position: relative; }
+  .chart svg { display: block; width: 100%; height: auto; overflow: visible; }
+  .chart-title { display: flex; justify-content: space-between; align-items: baseline; gap: .5rem; margin-top: .4rem; }
+  .chart-title b { font-size: .9rem; }
+  .legend { display: flex; gap: .9rem; font-size: .78rem; color: var(--ink-2); flex-wrap: wrap; }
+  .legend i { display: inline-block; width: 14px; height: 10px; border-radius: 2px; margin-right: .3rem; vertical-align: -1px; }
+  .legend i.line { height: 0; border-top: 2px solid; border-radius: 0; vertical-align: 3px; }
+  .legend i.dash { height: 0; border-top: 2px dashed; border-radius: 0; vertical-align: 3px; }
+  #tip { position: fixed; pointer-events: none; z-index: 10; background: #fff; border: 1px solid var(--ring); box-shadow: 0 4px 16px rgba(0,0,0,.08); border-radius: 8px; padding: .5rem .65rem; font-size: .8rem; display: none; min-width: 170px; }
+  #tip .t { color: var(--ink-2); margin-bottom: .2rem; }
+  #tip .r { display: flex; align-items: center; gap: .4rem; justify-content: space-between; }
+  #tip .r span:first-child { color: var(--ink-2); } #tip .r b { font-variant-numeric: tabular-nums; }
+  #tip .k { display: inline-block; width: 12px; border-top: 2px solid; margin-right: .3rem; vertical-align: 3px; }
+  /* fleet grid */
+  .fleet-wrap { overflow-x: auto; }
+  table.fleet { border-collapse: separate; border-spacing: 0; font-size: .8rem; width: 100%; margin: 0; }
+  table.fleet th, table.fleet td { padding: .3rem .4rem; border-bottom: 1px solid var(--grid); background: transparent; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  table.fleet thead th { font-weight: 600; color: var(--ink-2); font-size: .74rem; border-bottom: 1px solid var(--axis); }
+  table.fleet td.c, table.fleet th.c { padding: 0; width: 18px; min-width: 18px; text-align: center; border-left: 2px solid var(--surface); }
+  table.fleet th.c { font-weight: 400; color: var(--muted); font-size: .68rem; text-align: left; overflow: visible; }
+  .cell { height: 22px; border-radius: 3px; }
+  .l0 { background: transparent; } .idle { background: var(--idle); }
+  .l1 { background: var(--b1); } .l2 { background: var(--b2); } .l3 { background: var(--b3); } .l4 { background: var(--b4); }
+  .status-ok { color: var(--good-text); font-weight: 600; } .status-bad { color: var(--critical); font-weight: 600; }
+  /* updates */
+  .chips { display: flex; gap: .4rem; flex-wrap: wrap; margin-bottom: .5rem; }
+  .chip { font-size: .78rem; padding: .2rem .6rem; border-radius: 999px; border: 1px solid var(--ring); background: #fff; cursor: pointer; color: var(--ink-2); }
+  .chip:hover { background: var(--idle); }
+  table.props { font-size: .85rem; margin: 0; }
+  table.props td, table.props th { background: transparent; vertical-align: middle; }
+  .diff { white-space: nowrap; } .diff s { color: var(--muted); } .diff b { color: var(--ink); }
+  .quote { color: var(--ink-2); font-style: italic; }
+  .act { display: flex; gap: .35rem; } .act form { margin: 0; }
+  .act button { margin: 0; padding: .25rem .7rem; font-size: .8rem; width: auto; }
+  .tag { font-size: .72rem; font-weight: 600; padding: .1rem .5rem; border-radius: 999px; background: var(--idle); color: var(--ink-2); white-space: nowrap; }
+  .tag.accepted, .tag.published { background: #e3f6ea; color: var(--good-text); }
+  .tag.invalid, .tag.rejected { background: #fde8e8; color: #9b1c1c; }
+  .tag.draft { background: #fff4d6; color: #7a5300; }
+  table.revs { font-size: .85rem; margin: 0; } table.revs td, table.revs th { background: transparent; }
+  .busy button[type=submit] { opacity: .6; pointer-events: none; }
+  details summary { font-size: .85rem; color: var(--ink-2); }
+  @media (max-width: 860px) { .kpis { grid-template-columns: repeat(2, 1fr); } .steps { grid-template-columns: 1fr; } }
+</style>
 </head>
 <body>
 <main class="container">
-  <hgroup>
-    <h1>Tonight's charging plan</h1>
-    <p>{{ site.name }} · {{ date.strftime("%a %d %b %Y") }} · site limit <b>{{ site.site_limit_kw|round(0)|int }} kW</b> · charger efficiency η {{ eta }}</p>
-  </hgroup>
 
-  {# ---------- KPIs ---------- #}
-  <section class="kpis">
-    {% if plan %}
-      {% set saving = plan.baseline_cost_gbp - plan.cost_gbp %}
-      <article><span class="muted">Optimised cost</span><strong>£{{ "%.2f"|format(plan.cost_gbp) }}</strong></article>
-      <article><span class="muted">Charge-on-arrival baseline</span><strong>£{{ "%.2f"|format(plan.baseline_cost_gbp) }}</strong></article>
-      <article><span class="muted">Saving tonight</span><strong class="{{ 'good' if saving >= 0 else 'bad' }}">£{{ "%.2f"|format(saving) }}
-        {% if plan.baseline_cost_gbp > 0 %}<small>({{ (100*saving/plan.baseline_cost_gbp)|round(0)|int }}%)</small>{% endif %}</strong></article>
-      {% if plan.carbon_kg is not none %}
-      <article><span class="muted">CO₂ plan vs baseline</span><strong>{{ plan.carbon_kg|round(1) }} / {{ plan.baseline_carbon_kg|round(1) }} kg</strong></article>
-      {% endif %}
-    {% else %}
-      <article><span class="muted">No plan yet</span><strong>Run the optimiser ↓</strong></article>
-    {% endif %}
-  </section>
-
-  {# ---------- actions ---------- #}
-  <section style="margin-top:1rem">
-    <div role="group">
-      <form method="post" action="/prices/refresh" class="inline"><button class="secondary outline">↻ Refresh prices &amp; carbon</button></form>
-      <form method="post" action="/plan" class="inline"><button>⚡ Optimise (new draft)</button></form>
-      {% if plan and plan.status == "draft" %}
-      <form method="post" action="/plan/{{ plan.id }}/publish" class="inline"><button class="contrast">✓ Publish rev {{ plan.revision }}</button></form>
+  <header class="top">
+    <div>
+      <p class="eyebrow">Overnight charging planner</p>
+      <h1>{{ site.name }}</h1>
+      <div class="muted small">Tonight · {{ date.strftime("%a %-d %b") }} · {{ window[0] }}–{{ window[1] }} London time · {{ fleet|length }} vans · site limit {{ site.site_limit_kw|round(0)|int }} kW · charger efficiency {{ (eta*100)|int }}%</div>
+    </div>
+    <div>
+      {% if published %}
+        <span class="pill"><span class="dot" style="background:var(--good)"></span>✓ Published: rev {{ published.revision }}</span>
+      {% else %}
+        <span class="pill"><span class="dot" style="background:var(--warning)"></span>! No plan published yet</span>
       {% endif %}
     </div>
-    <p class="muted">
-      {% if plan %}Showing <b>revision {{ plan.revision }}</b> <span class="tag {{ plan.status }}">{{ plan.status }}</span> · created {{ plan.created_at|local }}.{% endif %}
-      {% if published %} Published plan: rev {{ published.revision }}.{% else %} Nothing published yet tonight.{% endif %}
-    </p>
+  </header>
+
+  {% if msg %}<div class="banner info" role="status">ℹ︎ <div>{{ msg }}</div></div>{% endif %}
+
+  {# ---------- the three steps ---------- #}
+  <section class="card steps" aria-label="Plan steps">
+    <div class="step">
+      <span class="n">1 · Prices &amp; carbon</span>
+      <span class="small muted">{% if n_prices %}{{ n_prices - n_fallback }}/{{ n_prices }} half-hours from Octopus Agile{% if fetched %} · updated {{ fetched|local }}{% endif %}{% else %}Not loaded yet{% endif %}</span>
+      <form method="post" action="/prices/refresh" class="js-busy"><button type="submit" class="secondary outline" data-busy="Fetching…">↻ Refresh prices</button></form>
+    </div>
+    <div class="step">
+      <span class="n">2 · Optimise</span>
+      <span class="small muted">{% if plan %}Viewing rev {{ plan.revision }} <span class="tag {{ plan.status }}">{{ plan.status }}</span>{% else %}No plan yet tonight{% endif %}</span>
+      <form method="post" action="/plan" class="js-busy"><button type="submit" class="{{ '' if (not plan or stale) else 'secondary' }}" data-busy="Optimising…">⚡ Optimise → new draft</button></form>
+    </div>
+    <div class="step">
+      <span class="n">3 · Publish</span>
+      <span class="small muted">{% if published %}Live: rev {{ published.revision }}{% else %}Nothing published{% endif %}</span>
+      {% if plan and plan.status != "published" %}
+      <form method="post" action="/plan/{{ plan.id }}/publish"><button type="submit" class="contrast">✓ Publish rev {{ plan.revision }}</button></form>
+      {% else %}
+      <button disabled class="outline">{{ "Rev " ~ plan.revision ~ " is live" if plan else "Optimise first" }}</button>
+      {% endif %}
+    </div>
   </section>
 
-  {# ---------- infeasible vans ---------- #}
-  {% set short = outcomes.values()|selectattr("infeasible_reason")|list %}
-  {% if short %}
-  <article style="border-left:4px solid #b42318">
-    <b>{{ short|length }} van{{ 's' if short|length > 1 }} won't reach target</b>
-    <ul style="margin-bottom:0">
-      {% for o in short %}<li><b>{{ names[o.vehicle_id] }}</b>: {{ o.infeasible_reason }}</li>{% endfor %}
-    </ul>
-  </article>
+  {% if stale %}
+  <div class="banner warn">⚠︎ <div><b>Plan out of date.</b> Tonight's van details changed after revision {{ plan.revision }} was built. Re-optimise before publishing.</div></div>
   {% endif %}
 
-  {# ---------- slot grid: prices, carbon, per-van allocation ---------- #}
-  <section>
-    <h2>Half-hourly plan <small class="muted">(kW per van; London time)</small></h2>
-    {% if n_fallback %}<p class="muted">⚠ {{ n_fallback }} of {{ prices|length }} price slots use a fallback curve (Agile not yet published for those times).</p>{% endif %}
-    {% if not prices %}<p class="muted">No prices loaded yet: click <b>Refresh prices</b>.</p>{% endif %}
-    <div class="grid-wrap">
-    <table class="slots">
-      <thead><tr><th></th>{% for s in slots %}<th>{{ s|local }}</th>{% endfor %}</tr></thead>
+  {# ---------- KPIs ---------- #}
+  {% if plan %}
+  {% set saving = plan.baseline_cost_gbp - plan.cost_gbp %}
+  <section class="kpis">
+    <div class="kpi"><div class="label">Cost tonight</div><div class="value">{{ plan.cost_gbp|gbp }}</div><div class="sub">rev {{ plan.revision }} · optimised</div></div>
+    <div class="kpi"><div class="label">Saving vs charge-on-arrival</div>
+      <div class="value {{ 'good-text' if saving > 0.005 else '' }}">{{ saving|gbp }}</div>
+      <div class="sub">baseline {{ plan.baseline_cost_gbp|gbp }}{% if plan.baseline_cost_gbp > 0 %} · {{ (100*saving/plan.baseline_cost_gbp)|round(0)|int }}% less{% endif %}</div></div>
+    <div class="kpi"><div class="label">CO₂ tonight</div>
+      <div class="value">{{ plan.carbon_kg|round(1) if plan.carbon_kg is not none else "–" }} kg</div>
+      <div class="sub">{% if plan.baseline_carbon_kg %}baseline {{ plan.baseline_carbon_kg|round(1) }} kg · {{ (plan.baseline_carbon_kg - plan.carbon_kg)|round(1) }} kg less{% endif %}</div></div>
+    <div class="kpi"><div class="label">Vans reaching target</div>
+      <div class="value {{ 'bad-text' if n_short else 'good-text' }}">{{ fleet|length - n_short }}/{{ fleet|length }}</div>
+      <div class="sub">{% if n_short %}✕ {{ n_short }} short, see below{% else %}✓ all on target by departure{% endif %}</div></div>
+  </section>
+  {% endif %}
+
+  {% set short = fleet|selectattr("o")|selectattr("o.infeasible_reason")|list %}
+  {% if short %}
+  <div class="banner crit">✕ <div><b>{{ short|length }} van{{ 's' if short|length > 1 }} won't reach target charge</b>
+    <ul>{% for f in short %}<li><b>{{ f.v.name }}</b> ({{ f.o.delivered_kwh|round(1) }} of {{ f.o.need_kwh|round(1) }} kWh): {{ f.o.infeasible_reason }}</li>{% endfor %}</ul></div></div>
+  {% endif %}
+
+  {# ---------- charts ---------- #}
+  <section class="card" aria-label="Tonight's timeline">
+    <h2>When the depot charges</h2>
+    <p class="muted small" style="margin:0">Charging moves into cheaper, cleaner half-hours while staying under the site limit.{% if n_fallback %} Prices marked ◦ are estimates (Agile not yet published).{% endif %}</p>
+    <div class="chart-title"><b>Site load, kW</b>
+      <div class="legend"><span><i style="background:var(--blue)"></i>Optimised</span><span><i class="line" style="border-color:var(--ink-2)"></i>Charge on arrival</span><span><i class="dash" style="border-color:var(--critical)"></i>Site limit</span></div></div>
+    <div class="chart" id="c-load"></div>
+    <div class="chart-title"><b>Price, p/kWh</b><div class="legend"><span><i class="line" style="border-color:var(--orange)"></i>Octopus Agile, London</span></div></div>
+    <div class="chart" id="c-price"></div>
+    <div class="chart-title"><b>Carbon intensity, g CO₂/kWh</b><div class="legend"><span><i class="line" style="border-color:var(--aqua)"></i>Forecast, London</span></div></div>
+    <div class="chart" id="c-carbon"></div>
+    <details><summary>Show as table</summary>
+      <div class="fleet-wrap"><table class="fleet"><thead><tr><th>Half-hour</th><th>Price p/kWh</th><th>Carbon g/kWh</th><th>Optimised kW</th><th>On arrival kW</th></tr></thead><tbody>
+      {% for i in range(chart.labels|length) %}<tr><td>{{ chart.labels[i] }}</td><td>{{ chart.price[i]|round(2) if chart.price[i] is not none else "–" }}{{ " (est.)" if chart.fallback[i] }}</td><td>{{ chart.carbon[i]|int if chart.carbon[i] is not none else "–" }}</td><td>{{ chart.opt[i] if chart.opt else "–" }}</td><td>{{ chart.base[i] if chart.base else "–" }}</td></tr>{% endfor %}
+      </tbody></table></div></details>
+  </section>
+
+  {# ---------- fleet plan ---------- #}
+  <section class="card" aria-label="Fleet plan">
+    <h2>Fleet plan</h2>
+    <p class="muted small" style="margin:0 0 .5rem">Each square is a half-hour. Darker blue means charging closer to the van's max rate; grey means plugged in but idle.</p>
+    <div class="fleet-wrap">
+    <table class="fleet">
+      <thead><tr>
+        <th>Van</th><th>Window</th><th>Charge</th><th>Needs</th><th>Plan</th>
+        {% for t in slots %}<th class="c">{% if loop.index0 % 4 == 0 %}{{ t|local }}{% endif %}</th>{% endfor %}
+      </tr></thead>
       <tbody>
-        <tr><td>Price p/kWh</td>
-          {% for p in prices %}
-            <td style="background: rgba({{ '220,60,40' if p.price_p_per_kwh >= 0 else '30,140,80' }}, {{ (0.08 + 0.6*(p.price_p_per_kwh|abs)/max_price)|round(2) }})"
-                title="{{ p.source }} · {{ p.source_url }}">{{ p.price_p_per_kwh|round(1) }}{% if p.source != 'octopus' %}*{% endif %}</td>
-          {% endfor %}</tr>
-        <tr><td>Carbon g/kWh</td>
-          {% for p in prices %}
-            <td style="background: rgba(110,110,110,{{ (0.05 + 0.5*(p.carbon_g_per_kwh or 0)/max_carbon)|round(2) }})">{{ p.carbon_g_per_kwh|int if p.carbon_g_per_kwh is not none else "–" }}</td>
-          {% endfor %}</tr>
-        {% for v, s in rows %}
-        <tr><td>{{ v.name }}</td>
-          {% for t in slots %}
-            {% set kw = grid.get((v.id, t), 0) %}
-            {% set plugged = s.arrival_at <= t and t < s.departure_at %}
-            {% if kw > 0 %}<td class="cell-on" style="background: rgba(37,99,235,{{ (0.25 + 0.75*kw/v.max_charge_kw)|round(2) }})">{{ kw|round(0)|int }}</td>
-            {% elif plugged %}<td style="background:#f1f4fa">·</td>
-            {% else %}<td></td>{% endif %}
-          {% endfor %}</tr>
-        {% endfor %}
-        {% if plan %}
-        <tr><td><b>Site load</b></td>
-          {% for t in slots %}<td class="{{ 'bad' if load[t] > site.site_limit_kw + 0.01 }}"><b>{{ load[t]|round(0)|int }}</b></td>{% endfor %}</tr>
-        {% endif %}
+      {% for f in fleet %}
+        <tr>
+          <td><b>{{ f.v.name }}</b><div class="small muted">{{ f.v.battery_kwh|int }} kWh · {{ f.v.max_charge_kw|int }} kW</div></td>
+          <td>{{ f.s.arrival_at|local }}–{{ f.s.departure_at|local }}</td>
+          <td>{{ (f.s.arrival_soc*100)|round(0)|int }}% → {{ (f.s.target_soc*100)|round(0)|int }}%</td>
+          <td>{{ f.need|round(1) }} kWh</td>
+          <td>{% if f.o %}{% if f.o.infeasible_reason %}<span class="status-bad" title="{{ f.o.infeasible_reason }}">✕ {{ f.o.delivered_kwh|round(1) }}</span>{% else %}<span class="status-ok">✓ {{ f.o.delivered_kwh|round(1) }}</span>{% endif %}{% else %}<span class="muted">–</span>{% endif %}</td>
+          {% for c in f.cells %}<td class="c"><div class="cell {{ 'l' ~ c.level if c.kw > 0 else ('idle' if c.plugged else 'l0') }}" title="{{ f.v.name }} · {{ slots[loop.index0]|local }} · {{ (c.kw|round(1) ~ ' kW') if c.kw > 0 else ('plugged in, idle' if c.plugged else 'not on site') }}"></div></td>{% endfor %}
+        </tr>
+      {% endfor %}
       </tbody>
     </table>
     </div>
-    <p class="muted"><small>Blue = charging (darker = closer to max rate) · light grey = plugged in, idle · * = fallback price. Hover a price for its source.</small></p>
   </section>
 
-  {# ---------- vans ---------- #}
-  <section>
-    <h2>Vans tonight</h2>
-    <table class="striped">
-      <thead><tr><th>Van</th><th>Battery</th><th>Max kW</th><th>Arrives</th><th>Departs</th><th>SoC in → target</th><th>Need</th><th>Planned</th></tr></thead>
-      <tbody>
-      {% for v, s in rows %}
-        {% set o = outcomes.get(v.id) %}
-        <tr>
-          <td>{{ v.name }}</td><td>{{ v.battery_kwh|int }} kWh</td><td>{{ v.max_charge_kw|int }}</td>
-          <td>{{ s.arrival_at|local }}</td><td>{{ s.departure_at|local }}</td>
-          <td>{{ (s.arrival_soc*100)|round(0)|int }}% → {{ (s.target_soc*100)|round(0)|int }}%</td>
-          <td>{{ ((s.target_soc - s.arrival_soc) * v.battery_kwh)|round(1) }} kWh</td>
-          <td>{% if o %}<span class="{{ 'bad' if o.infeasible_reason else 'good' }}">{{ o.delivered_kwh|round(1) }} kWh</span>{% else %}–{% endif %}</td>
-        </tr>
-      {% endfor %}
-      </tbody>
-    </table>
-  </section>
-
-  {# ---------- LLM proposals ---------- #}
-  <section>
-    <h2>Driver / dispatcher updates</h2>
-    <form method="post" action="/proposals">
-      <textarea name="text" rows="3" placeholder="e.g. Van 03 stuck on the A40, now arriving about 23:30 with 20% left. Van 07 needs to be full by 05:00." required></textarea>
-      <button type="submit" class="secondary">Extract proposed changes (LLM)</button>
+  {# ---------- updates from drivers ---------- #}
+  <section class="card" id="updates" aria-label="Driver and dispatcher updates">
+    <h2>Driver &amp; dispatcher updates</h2>
+    <p class="muted small" style="margin:0 0 .5rem">Paste a note. The AI suggests changes to tonight's vans; each is checked before you see it, and nothing changes until you accept it.</p>
+    <div class="chips">
+      <button type="button" class="chip" data-text="Van 03 stuck on the A40, now arriving about 23:30 with maybe 20% left.">Late arrival</button>
+      <button type="button" class="chip" data-text="Van 06 has an early job, needs to leave at 04:30 and be at least 95% full.">Early departure</button>
+      <button type="button" class="chip" data-text="Van 02 came back with 60% after a short route.">Higher charge</button>
+    </div>
+    <form method="post" action="/proposals" class="js-busy">
+      <textarea name="text" id="note" rows="3" maxlength="2000" placeholder="e.g. Van 03 stuck on the A40, now arriving about 23:30 with maybe 20% left." required></textarea>
+      <button type="submit" class="secondary" data-busy="Reading note… (a few seconds)" style="width:auto">Suggest changes</button>
     </form>
-    {% if proposals %}
-    <table>
-      <thead><tr><th>Van</th><th>Field</th><th>Proposed value</th><th>Evidence (quote)</th><th>Status</th><th></th></tr></thead>
+
+    {% if pending %}
+    <h3 style="font-size:.95rem;margin-top:.5rem">Waiting for you ({{ pending|length }})</h3>
+    <table class="props">
+      <thead><tr><th>Van</th><th>Change</th><th>From → to</th><th>From the note</th><th></th></tr></thead>
       <tbody>
-      {% for p in proposals %}
+      {% for x in pending %}
         <tr>
-          <td>{{ names.get(p.vehicle_id, "–") }}</td>
-          <td>{{ p.field or "–" }}</td>
-          <td>{% if p.value and p.field and p.field.endswith("_at") %}{{ p.value|isolocal }}{% elif p.value %}{{ ((p.value|float)*100)|round(0)|int }}%{% else %}–{% endif %}</td>
-          <td><i>{{ ('"' ~ p.quote ~ '"') if p.quote else "" }}</i>{% if p.error %}<br><small class="bad">{{ p.error }}</small>{% endif %}</td>
-          <td><span class="tag {{ p.status }}">{{ p.status }}</span></td>
-          <td>{% if p.status == "pending" %}
-            <form method="post" action="/proposals/{{ p.id }}/accept" class="inline"><button>Accept</button></form>
-            <form method="post" action="/proposals/{{ p.id }}/reject" class="inline"><button class="secondary outline">Reject</button></form>
-          {% endif %}</td>
+          <td><b>{{ x.van }}</b></td><td>{{ x.label }}</td>
+          <td class="diff"><s>{{ x.before }}</s> → <b>{{ x.after }}</b></td>
+          <td class="quote">“{{ x.p.quote }}”</td>
+          <td><div class="act">
+            <form method="post" action="/proposals/{{ x.p.id }}/accept"><button type="submit">Accept</button></form>
+            <form method="post" action="/proposals/{{ x.p.id }}/reject"><button type="submit" class="secondary outline">Reject</button></form>
+          </div></td>
         </tr>
       {% endfor %}
       </tbody>
     </table>
-    <p class="muted"><small>Accepted changes update tonight's sessions. Re-run <b>Optimise</b> to get a new draft revision.</small></p>
+    {% endif %}
+
+    {% if history %}
+    <details {% if not pending %}open{% endif %} style="margin-top:.5rem"><summary>Earlier suggestions ({{ history|length }})</summary>
+    <table class="props">
+      <tbody>
+      {% for x in history %}
+        <tr>
+          <td>{{ x.van }}</td><td>{{ x.label }}</td><td class="diff">{{ x.after }}</td>
+          <td class="quote">{{ ("“" ~ x.p.quote ~ "”") if x.p.quote else "" }}{% if x.p.error %}<div class="small bad-text" style="font-style:normal">{{ x.p.error }}</div>{% endif %}</td>
+          <td><span class="tag {{ x.p.status }}">{{ x.p.status }}</span></td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    </details>
     {% endif %}
   </section>
+
+  {# ---------- revisions ---------- #}
+  {% if plans %}
+  <section class="card" aria-label="Plan revisions">
+    <h2>Tonight's revisions</h2>
+    <table class="revs">
+      <thead><tr><th>Rev</th><th>Built</th><th>Cost</th><th>Saving</th><th>Short vans</th><th>Status</th><th></th></tr></thead>
+      <tbody>
+      {% for p in plans %}
+        <tr {% if plan and p.id == plan.id %}style="font-weight:600"{% endif %}>
+          <td>{{ p.revision }}</td><td>{{ p.created_at|local }}</td><td>{{ p.cost_gbp|gbp }}</td>
+          <td>{{ (p.baseline_cost_gbp - p.cost_gbp)|gbp }}</td><td>{{ shortfalls.get(p.id, 0) }}</td>
+          <td><span class="tag {{ p.status }}">{{ p.status }}</span></td>
+          <td>{% if not plan or p.id != plan.id %}<a href="/?plan={{ p.id }}">View</a>{% else %}<span class="muted small">viewing</span>{% endif %}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </section>
+  {% endif %}
+
+  <p class="muted small">Prices: Octopus Agile (London, region C). Carbon: carbonintensity.org.uk (London). Plan: linear program (SciPy HiGHS) minimising cost under per-van and site power limits.</p>
 </main>
+
+<div id="tip" role="tooltip"></div>
+<script id="chart-data" type="application/json">{{ chart|tojson }}</script>
+<script>
+(() => {
+  const D = JSON.parse(document.getElementById('chart-data').textContent);
+  const N = D.labels.length, css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+  const W = 1000, PADL = 44, PADR = 8, tip = document.getElementById('tip');
+  const x = i => PADL + (W - PADL - PADR) * i / N, bw = (W - PADL - PADR) / N;
+  const NS = 'http://www.w3.org/2000/svg';
+  const el = (tag, attrs, parent) => { const e = document.createElementNS(NS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); parent && parent.appendChild(e); return e; };
+  const nice = v => { const p = Math.pow(10, Math.floor(Math.log10(v || 1))); return Math.ceil(v / p / (v / p > 5 ? 2 : 1)) * p * (v / p > 5 ? 2 : 1); };
+
+  function frame(id, H, max, min, unit) {
+    const host = document.getElementById(id), svg = el('svg', { viewBox: `0 0 ${W} ${H + 18}`, role: 'img' }, host);
+    const y = v => 4 + (H - 8) * (1 - (v - min) / (max - min));
+    for (let k = 0; k <= 2; k++) {
+      const v = min + (max - min) * k / 2;
+      el('line', { x1: PADL, x2: W - PADR, y1: y(v), y2: y(v), stroke: css(k === 0 ? '--axis' : '--grid'), 'stroke-width': 1 }, svg);
+      const t = el('text', { x: PADL - 6, y: y(v) + 4, 'text-anchor': 'end', 'font-size': 11, fill: css('--muted') }, svg); t.textContent = Math.round(v);
+    }
+    for (let i = 0; i < N; i += 4) { const t = el('text', { x: x(i), y: H + 14, 'font-size': 11, fill: css('--muted') }, svg); t.textContent = D.labels[i]; }
+    const cross = el('line', { y1: 0, y2: H, stroke: css('--ink-2'), 'stroke-width': 1, visibility: 'hidden' }, svg);
+    return { svg, y, H, cross };
+  }
+  function step(f, data, color, dash) {
+    let d = '';
+    data.forEach((v, i) => { if (v == null) return; d += `${d ? 'L' : 'M'}${x(i)},${f.y(v)}H${x(i + 1)}`; });
+    el('path', { d, fill: 'none', stroke: color, 'stroke-width': 2, 'stroke-dasharray': dash || '', 'stroke-linejoin': 'round' }, f.svg);
+  }
+  const frames = [];
+  // load chart
+  const loadMax = nice(Math.max(D.limit, ...(D.opt || [0]), ...(D.base || [0])) * 1.1);
+  const fl = frame('c-load', 150, loadMax, 0); frames.push(fl);
+  if (D.opt) D.opt.forEach((v, i) => { if (v > 0) { const h = fl.y(0) - fl.y(v); el('rect', { x: x(i) + 1, y: fl.y(v), width: bw - 2, height: Math.max(h, 0), rx: Math.min(4, h / 2), fill: css('--blue') }, fl.svg); } });
+  if (D.base) step(fl, D.base, css('--ink-2'));
+  el('line', { x1: PADL, x2: W - PADR, y1: fl.y(D.limit), y2: fl.y(D.limit), stroke: css('--critical'), 'stroke-width': 1.5, 'stroke-dasharray': '5 4' }, fl.svg);
+  if (!D.opt) { const t = el('text', { x: W / 2, y: 80, 'text-anchor': 'middle', 'font-size': 13, fill: css('--muted') }, fl.svg); t.textContent = 'Optimise to see the plan'; }
+  // price
+  const pv = D.price.filter(v => v != null), pMin = Math.min(0, ...pv), pMax = nice(Math.max(1, ...pv) * 1.05);
+  const fp = frame('c-price', 90, pMax, pMin); frames.push(fp); step(fp, D.price, css('--orange'));
+  D.fallback.forEach((f, i) => { if (f && D.price[i] != null) el('circle', { cx: x(i) + bw / 2, cy: fp.y(D.price[i]), r: 3, fill: '#fff', stroke: css('--orange'), 'stroke-width': 1.5 }, fp.svg); });
+  // carbon
+  const cv = D.carbon.filter(v => v != null);
+  const fc = frame('c-carbon', 90, nice(Math.max(1, ...cv) * 1.05), 0); frames.push(fc); step(fc, D.carbon, css('--aqua'));
+
+  // shared crosshair + tooltip
+  const row = (k, label, val) => `<div class="r"><span><i class="k" style="border-color:${k}"></i>${label}</span><b>${val}</b></div>`;
+  function show(i, ev) {
+    frames.forEach(f => { f.cross.setAttribute('x1', x(i) + bw / 2); f.cross.setAttribute('x2', x(i) + bw / 2); f.cross.setAttribute('visibility', 'visible'); });
+    const fmt = (v, d, u) => v == null ? '–' : v.toFixed(d) + u;
+    tip.innerHTML = '';
+    const t = document.createElement('div'); t.className = 't'; t.textContent = `${D.labels[i]}–${D.labels[i + 1] || ''}`; tip.appendChild(t);
+    tip.insertAdjacentHTML('beforeend',
+      (D.opt ? row(css('--blue'), 'Optimised', fmt(D.opt[i], 1, ' kW')) : '') +
+      (D.base ? row(css('--ink-2'), 'On arrival', fmt(D.base[i], 1, ' kW')) : '') +
+      row(css('--orange'), 'Price' + (D.fallback[i] ? ' (est.)' : ''), fmt(D.price[i], 2, 'p')) +
+      row(css('--aqua'), 'Carbon', fmt(D.carbon[i], 0, ' g')));
+    tip.style.display = 'block';
+    const r = tip.getBoundingClientRect();
+    tip.style.left = Math.min(ev.clientX + 14, innerWidth - r.width - 8) + 'px';
+    tip.style.top = (ev.clientY + 14) + 'px';
+  }
+  frames.forEach(f => {
+    f.svg.addEventListener('pointermove', ev => {
+      const p = f.svg.createSVGPoint(); p.x = ev.clientX; p.y = ev.clientY;
+      const lx = p.matrixTransform(f.svg.getScreenCTM().inverse()).x;
+      const i = Math.floor((lx - PADL) / bw); if (i >= 0 && i < N) show(i, ev);
+    });
+    f.svg.addEventListener('pointerleave', () => { tip.style.display = 'none'; frames.forEach(g => g.cross.setAttribute('visibility', 'hidden')); });
+  });
+
+  // UX: example chips, busy states
+  document.querySelectorAll('.chip').forEach(c => c.addEventListener('click', () => { const n = document.getElementById('note'); n.value = c.dataset.text; n.focus(); }));
+  document.querySelectorAll('form.js-busy').forEach(f => f.addEventListener('submit', () => {
+    const b = f.querySelector('button[type=submit]'); if (b && b.dataset.busy) { b.textContent = b.dataset.busy; b.setAttribute('aria-busy', 'true'); }
+    f.classList.add('busy');
+  }));
+})();
+</script>
 </body>
 </html>

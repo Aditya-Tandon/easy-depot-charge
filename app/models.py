@@ -50,6 +50,7 @@ class Plan(SQLModel, table=True):
     baseline_cost_gbp: float
     carbon_kg: Optional[float] = None
     baseline_carbon_kg: Optional[float] = None
+    baseline_load_json: Optional[str] = None  # JSON list: charge-on-arrival site kW per slot
     created_at: datetime
 
 

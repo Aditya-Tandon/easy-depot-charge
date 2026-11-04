@@ -27,7 +27,8 @@ FLEET = [
     ("Van 07", "23:30", "05:00", 0.10, 1.00),
     ("Van 08", "18:00", "07:00", 0.35, 0.80),
 ]
-TEXT = "Van 3 stuck in traffic, now arriving about 23:30 with maybe 20% left; Van 7 must be full by 5am"
+# Van 03 normally arrives 19:30 at 20%; Van 05 normally departs 07:30 at 90% (so none of these are no-ops)
+TEXT = "Van 3 stuck in traffic, now arriving about 23:30 with maybe 15% left; Van 5 must be full by 5am"
 
 
 def _utc(d: date, hhmm: str, next_day: bool = False) -> datetime:
@@ -59,9 +60,9 @@ def run(llm_output: str, text: str = TEXT, d: date = D) -> list[Proposal]:
 
 HAPPY = out(
     P("Van 03", "arrival_at", "23:30", "now arriving about 23:30"),
-    P("Van 03", "arrival_soc", "20%", "maybe 20% left"),
-    P("Van 07", "target_soc", "100%", "Van 7 must be full by 5am"),
-    P("Van 07", "departure_at", "05:00", "Van 7 must be full by 5am"),
+    P("Van 03", "arrival_soc", "15%", "maybe 15% left"),
+    P("Van 05", "target_soc", "100%", "Van 5 must be full by 5am"),
+    P("Van 05", "departure_at", "05:00", "Van 5 must be full by 5am"),
 )
 
 
@@ -72,8 +73,8 @@ def test_happy_path_time_and_soc():
     assert [r.status for r in rows] == ["pending"] * 4, [r.error for r in rows]
     arr, soc, tgt, dep = rows
     assert (arr.vehicle_id, arr.field, arr.value) == (3, "arrival_at", "2026-11-04T23:30:00+00:00")
-    assert (soc.vehicle_id, soc.field, soc.value) == (3, "arrival_soc", "0.2")
-    assert (tgt.vehicle_id, tgt.value) == (7, "1.0")
+    assert (soc.vehicle_id, soc.field, soc.value) == (3, "arrival_soc", "0.15")
+    assert (tgt.vehicle_id, tgt.value) == (5, "1.0")
     assert dep.value == "2026-11-05T05:00:00+00:00"  # departure 05:00 -> next morning
     for r in rows:
         assert r.raw_text == TEXT and r.created_at == NOW and r.error is None and r.id is None
@@ -134,15 +135,15 @@ def test_extra_keys_rejected():
 
 def test_unknown_field_and_non_string_value_rejected():
     _single_schema_failure(run(out(P("Van 03", "battery_kwh", "60", "Van 3"))))
-    _single_schema_failure(run(out(P("Van 03", "arrival_soc", 0.2, "maybe 20% left"))))  # strict: str only
-    _single_schema_failure(run(json.dumps([P("Van 03", "arrival_soc", "20%", "maybe 20% left")])))
+    _single_schema_failure(run(out(P("Van 03", "arrival_soc", 0.2, "maybe 15% left"))))  # strict: str only
+    _single_schema_failure(run(json.dumps([P("Van 03", "arrival_soc", "15%", "maybe 15% left")])))
 
 
 # ---------- per-proposal checks ----------
 
 def test_unknown_vehicle():
     rows = run(out(P("Van 12", "arrival_at", "23:30", "now arriving about 23:30"),
-                   P("Van 03", "arrival_soc", "20%", "maybe 20% left")))
+                   P("Van 03", "arrival_soc", "15%", "maybe 15% left")))
     assert rows[0].status == "invalid" and "unknown vehicle 'Van 12'" in rows[0].error
     assert rows[0].vehicle_id is None and rows[0].field == "arrival_at"
     assert rows[1].status == "pending"  # one bad proposal does not sink the others
@@ -174,7 +175,7 @@ def test_vehicle_without_session():
 
 @pytest.mark.parametrize("value", ["150%", "150", "-10%", "lots"])
 def test_bad_soc(value):
-    rows = run(out(P("Van 03", "arrival_soc", value, "maybe 20% left")))
+    rows = run(out(P("Van 03", "arrival_soc", value, "maybe 15% left")))
     assert rows[0].status == "invalid" and "arrival_soc value" in rows[0].error
     assert rows[0].value == value  # raw model value kept for display
 
@@ -190,9 +191,10 @@ def test_arrival_after_departure():
     text = "Van 7 now not back until 06:00"
     rows = run(out(P("Van 07", "arrival_at", "06:00", "not back until 06:00")), text)
     assert rows[0].status == "invalid" and "would not be before departure" in rows[0].error
-    # departure moved before current arrival (Van 07 arrives 23:30, leaving 22:00 same evening)
-    rows = run(out(P("Van 07", "departure_at", "22:00", "Van 7")), "Van 7 leaves at 22:00")
-    assert rows[0].status == "invalid" and "would not be before departure" in rows[0].error
+    # a departure resolves to the first such time after arrival (see "limitations"), so it can only
+    # fail when no time within 24h after arrival matches: Van 07 arrives 23:30, "23:30" is 24h later
+    rows = run(out(P("Van 07", "departure_at", "23:30", "leaves at 23:30")), "Van 7 leaves at 23:30")
+    assert rows[0].status == "invalid" and "is not within 24h after arrival 23:30" in rows[0].error
 
 
 def test_target_not_above_arrival_soc():
@@ -273,7 +275,7 @@ def test_propose_saves_rows(db):
     assert len(rows) == 4 and all(r.id is not None and r.status == "pending" for r in rows)
     stored = db.exec(select(Proposal).order_by(Proposal.id)).all()
     assert [(p.vehicle_id, p.field) for p in stored] == [
-        (3, "arrival_at"), (3, "arrival_soc"), (7, "target_soc"), (7, "departure_at")]
+        (3, "arrival_at"), (3, "arrival_soc"), (5, "target_soc"), (5, "departure_at")]
     assert "Van 08" in json.loads(seen[0].content)[0]["settings"]["systemPrompt"]
 
 
@@ -326,7 +328,7 @@ def test_huge_digit_vehicle_name_does_not_crash():
 @pytest.mark.parametrize("value", ["1.5", "1.99"])
 def test_ambiguous_bare_soc_rejected(value):
     """A bare SoC between 1 and 2 is neither a clear fraction nor a clear percent."""
-    [r] = run(out(P("Van 03", "arrival_soc", value, "maybe 20% left")))
+    [r] = run(out(P("Van 03", "arrival_soc", value, "maybe 15% left")))
     assert r.status == "invalid" and "ambiguous" in r.error
 
 
@@ -345,3 +347,157 @@ def test_malformed_runware_payload_becomes_invalid_row():
     with DBSession(engine) as db, httpx.Client(transport=transport) as client:
         rows = propose(db, "Van 3 at 20%", D, client=client)
     assert len(rows) == 1 and rows[0].status == "invalid" and rows[0].error.startswith("LLM call failed")
+
+
+# ---- limitations ----
+
+def test_batch_conflict_checked_against_running_session():
+    """Proposals are validated in order against a running copy, so a later one can conflict with an earlier one."""
+    text = "Van 3 now arrives 06:30. Van 3 leaves at 06:00"
+    arr, dep = run(out(P("Van 03", "arrival_at", "06:30", "Van 3 now arrives 06:30"),
+                       P("Van 03", "departure_at", "06:00", "Van 3 leaves at 06:00")), text)
+    for alone in (out(P("Van 03", "arrival_at", "06:30", "Van 3 now arrives 06:30")),
+                  out(P("Van 03", "departure_at", "06:00", "Van 3 leaves at 06:00"))):
+        assert run(alone, text)[0].status == "pending"  # each is fine on its own
+    assert arr.status == "pending", arr.error
+    assert dep.status == "invalid"
+    assert "conflicts with earlier proposal 1 in this note" in dep.error
+    assert "arrival_at = 06:30" in dep.error
+
+
+def test_batch_running_copy_feeds_soc_check():
+    """A later SoC proposal is checked against an earlier valid one in the same note."""
+    text = "Van 8 arriving with 70% charge, only needs 60%"
+    a, t = run(out(P("Van 08", "arrival_soc", "70%", "arriving with 70% charge"),
+                   P("Van 08", "target_soc", "60%", "only needs 60%")), text)
+    assert a.status == "pending", a.error
+    assert t.status == "invalid" and "target_soc 60% would not exceed arrival_soc 70%" in t.error
+    assert "conflicts with earlier proposal 1" in t.error
+
+
+def test_invalid_proposal_not_applied_to_running_copy():
+    """Only valid proposals update the running copy."""
+    text = "Van 3 now arrives 08:00. Van 3 leaves at 07:30"
+    a, d = run(out(P("Van 03", "arrival_at", "08:00", "Van 3 now arrives 08:00"),   # after 07:00 departure
+                   P("Van 03", "departure_at", "07:30", "Van 3 leaves at 07:30")), text)
+    assert a.status == "invalid" and d.status == "pending", (a.error, d.error)
+    assert d.value == "2026-11-05T07:30:00+00:00"
+
+
+def test_duplicate_field_in_one_batch():
+    """A second proposal for the same van and field is invalid, whatever its value."""
+    text = "Van 3 arriving 23:30, no wait, 23:30 for sure"
+    for second in ("23:30", "22:00"):
+        a, b = run(out(P("Van 03", "arrival_at", "23:30", "Van 3 arriving 23:30"),
+                       P("van 3", "arrival_at", second, "23:30 for sure")), text)
+        assert a.status == "pending", a.error
+        assert b.status == "invalid"
+        assert b.error == "duplicate: Van 03 arrival_at was already proposed earlier in this note (proposal 1)"
+        assert b.vehicle_id == 3
+
+
+def test_no_op_time_rejected():
+    """Proposing a time the session already has is not a change (Van 07 already departs 05:00)."""
+    [r] = run(out(P("Van 07", "departure_at", "05:00", "Van 7 leaves at 05:00")), "Van 7 leaves at 05:00")
+    assert r.status == "invalid" and r.error == "no change: Van 07 departure_at is already 05:00"
+    [r] = run(out(P("Van 07", "arrival_at", "23:30", "Van 7 back 23:30")), "Van 7 back 23:30")
+    assert r.status == "invalid" and r.error == "no change: Van 07 arrival_at is already 23:30"
+
+
+def test_no_op_soc_rejected():
+    """Proposing a SoC within 0.5 points of the current one is not a change (Van 07 target is 100%)."""
+    [r] = run(out(P("Van 07", "target_soc", "100%", "Van 7 must be full")), "Van 7 must be full")
+    assert r.status == "invalid" and r.error == "no change: Van 07 target_soc is already 100%"
+    [r] = run(out(P("Van 03", "arrival_soc", "20.4%", "about 20.4% left")), "Van 3 has about 20.4% left")
+    assert r.status == "invalid" and r.error == "no change: Van 03 arrival_soc is already 20%"
+    [r] = run(out(P("Van 03", "arrival_soc", "21%", "about 21% left")), "Van 3 has about 21% left")
+    assert r.status == "pending", r.error
+
+
+def test_empty_result_parse_and_validate():
+    """An empty proposal list is a valid answer: no rows, not an error row."""
+    assert run('{"proposals": []}', text="All vans as planned tonight") == []
+    assert run('```json\n{"proposals": []}\n```', text="thanks!") == []
+
+
+def test_empty_result_propose_saves_nothing(db):
+    """propose() returns [] for an empty answer and stores nothing (the UI shows 'no changes found')."""
+    with httpx.Client(transport=httpx.MockTransport(runware_ok('{"proposals": []}', []))) as c:
+        assert propose(db, "All vans as planned tonight", D, client=c) == []
+    assert db.exec(select(Proposal)).all() == []
+
+
+def test_system_prompt_allows_empty_list():
+    """The prompt tells the model to return an empty list when the note changes nothing tonight."""
+    sp = " ".join(llm._system_prompt(["Van 01"]).split())
+    assert 'If nothing in the note changes tonight\'s sessions, output {"proposals": []}' in sp
+    assert "already" in sp  # restating a current value is not a change
+
+
+def _dep(van: str, hhmm: str, d: date = D, extra: tuple = ()) -> Proposal:
+    n = van[-1]
+    text = " ".join([q for *_, q in (x.values() for x in extra)] + [f"Van {n} leaves at {hhmm}"])
+    rows = run(out(*extra, P(van, "departure_at", hhmm, f"Van {n} leaves at {hhmm}")), text, d)
+    return rows[-1]
+
+
+@pytest.mark.parametrize("hhmm,expected", [
+    ("13:00", "2026-11-05T13:00:00+00:00"),  # late shift: next day, not "before arrival"
+    ("06:00", "2026-11-05T06:00:00+00:00"),  # usual: next morning
+    ("21:00", "2026-11-04T21:00:00+00:00"),  # after the 19:30 arrival the same evening
+])
+def test_departure_is_earliest_time_after_arrival(hhmm, expected):
+    """departure_at resolves to the first occurrence of that London time after the van's arrival."""
+    r = _dep("Van 03", hhmm)  # Van 03 arrives 19:30
+    assert r.status == "pending", r.error
+    assert r.value == expected
+
+
+def test_departure_before_arrival_time_of_day_rolls_to_next_day():
+    """Van 07 arrives 23:30, so 'leaves at 22:00' means 22:00 the next day (22.5h later)."""
+    r = _dep("Van 07", "22:00")
+    assert r.status == "pending", r.error
+    assert r.value == "2026-11-05T22:00:00+00:00"
+
+
+@pytest.mark.parametrize("d,hhmm,expected", [
+    (date(2026, 10, 24), "06:00", "2026-10-25T06:00:00+00:00"),  # clocks go back overnight: GMT morning
+    (date(2026, 10, 24), "13:00", "2026-10-25T13:00:00+00:00"),
+    (date(2026, 3, 28), "06:00", "2026-03-29T05:00:00+00:00"),   # clocks go forward overnight: BST morning
+    (date(2026, 3, 28), "13:00", "2026-03-29T12:00:00+00:00"),
+])
+def test_departure_on_dst_nights(d, hhmm, expected):
+    """Departure resolution is correct across both clock changes."""
+    r = _dep("Van 03", hhmm, d)
+    assert r.status == "pending", r.error
+    assert r.value == expected
+
+
+def test_departure_in_spring_forward_gap_rejected():
+    """01:30 on 29 Mar 2026 does not exist, and 01:30 on the 28th is before arrival."""
+    r = _dep("Van 03", "01:30", date(2026, 3, 28))
+    assert r.status == "invalid" and "clock change" in r.error
+
+
+def test_departure_uses_running_arrival():
+    """Departure is resolved against an arrival proposed earlier in the same note."""
+    arr = P("Van 03", "arrival_at", "00:30", "Van 3 back 00:30")  # next morning, before the 07:00 departure
+    ok = _dep("Van 03", "13:00", extra=(arr,))
+    assert ok.status == "pending" and ok.value == "2026-11-05T13:00:00+00:00", ok.error
+    bad = _dep("Van 03", "00:15", extra=(arr,))  # 00:15 on either day is before the 00:30 arrival
+    assert bad.status == "invalid"
+    assert "conflicts with earlier proposal 1 in this note (Van 03 arrival_at = 00:30)" in bad.error
+
+
+def test_departure_not_within_24h_rejected():
+    """A departure exactly 24h after arrival (same clock time) is rejected."""
+    r = _dep("Van 03", "19:30")
+    assert r.status == "invalid" and "within 24h" in r.error
+
+
+def test_invalid_proposal_does_not_block_corrected_retry():
+    """A rejected first attempt must not make the model's corrected second attempt a 'duplicate'."""
+    text = "Van 3 arriving 25:00 no sorry 23:30"
+    rows = run(out(P("Van 03", "arrival_at", "25:00", "arriving 25:00"),
+                   P("Van 03", "arrival_at", "23:30", "no sorry 23:30")), text=text)
+    assert [r.status for r in rows] == ["invalid", "pending"], [r.error for r in rows]

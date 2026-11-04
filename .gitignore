@@ -6,3 +6,4 @@ local.db
 .env*
 .DS_Store
 !.env.example
+.neon

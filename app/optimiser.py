@@ -14,12 +14,19 @@ need_kwh is energy required IN THE BATTERY, so grid energy = need_kwh / eta.
 Prices are in pence/kWh (grid side). Costs returned are in GBP.
 Carbon (optional) is g/kWh (grid side). Carbon returned in kg.
 
-Optimised plan: minimise sum_t price[t] * sum_v p[v,t] * slot_h, subject to
+Optimised plan: subject to
   0 <= p[v,t] <= max_kw            while plugged in, else p = 0
   sum_v p[v,t] <= site_limit_kw    for every t
   eta * sum_t p[v,t] * slot_h + unmet[v] >= need_kwh[v]
-  unmet[v] >= 0, heavily penalised  (so the LP always solves; any shortfall
-                                     is reported per van, never silently dropped)
+  unmet[v] >= 0                    (so the LP always solves; any shortfall
+                                    is reported per van, never silently dropped)
+optimise LEXICOGRAPHICALLY:
+  (a) minimise total unmet kWh  sum_v unmet[v];
+  (b) then minimise the worst fractional site shortfall
+        max_v (unmet[v] - rate_short[v]) / need_kwh[v]
+      where rate_short[v] = max(0, need - eta * max_kw * hours) is the part of the
+      shortfall the van could never avoid (reasons 1/2; = need for no-window vans);
+  (c) then minimise cost  sum_t price[t] * sum_v p[v,t] * slot_h.
 Delivered energy is never more than need (no overcharging beyond need).
 
 Baseline ("charge on arrival"): process slots in time order; in each slot,
@@ -35,6 +42,10 @@ Infeasibility reasons (VanResult.reason, None if fully met), checked in order:
   3. site:   individually feasible but unmet > tol after optimisation
      -> "site limit L kW contended HH:MM-HH:MM: short Z kWh" (slot-index based
         label if no clock times given; see `slot_labels`)
+  A rate-limited van (reason 2) that is ALSO squeezed by the site limit keeps its
+  rate reason, and if its actual shortfall exceeds the rate shortfall by > 0.05 kWh
+  gets "; site limit L kW contended HH:MM-HH:MM: further short W kWh" appended
+  (W = actual shortfall - rate shortfall).
 Vans failing 1 or 2 are still charged as much as possible (best effort).
 Tolerance for "met": 1e-6 kWh (use 1e-3 when comparing in tests).
 
@@ -52,6 +63,20 @@ Clarifications (binding for implementation and tests):
   - PlanOut.vans and PlanOut.baseline are in the same order as the input vans.
   - Baseline vans get reason None if fully met; otherwise any non-empty reason.
   - Optimised cost is always <= baseline cost when every van is met in both.
+  - Contended span: the slots in the van's (clipped) window where site load is at
+    the limit (within tol), first..last; label is start of first slot to END of
+    last slot ("18:30-19:30" for slots 1..2 of 18:00,18:30,19:00,19:30). If the
+    last contended slot is the last label, the end is extrapolated by slot_h.
+  - Fairness (b) is min-max, not full leximin: once the worst-off van is fixed,
+    vans better off than it may still be split by cost. Rate-limited / no-window
+    vans count only their site-attributable shortfall in (b), so an unavoidable
+    shortfall never makes (b) vacuous for the rest of the fleet.
+  - Implementation of the lexicographic order: stage 1 solves (a)+(c) with an
+    unmet penalty that provably dominates any price/eta (so it is exactly (a)
+    then (c)); if its unmet equals the sum of rate shortfalls, (b) is already 0
+    and that plan is final (one solve). Otherwise stage 2 minimises (b) with
+    total unmet fixed at the stage-1 optimum, and stage 3 minimises cost+penalty
+    with (a) and (b) fixed. Each fixed optimum is relaxed by rel 1e-7 + abs 1e-6.
 """
 from __future__ import annotations
 
@@ -109,6 +134,14 @@ def _f(x: float) -> str:
     return f"{x:.1f}"
 
 
+def _rate_cap(v: VanIn, n: int, eta: float, slot_h: float) -> float:
+    """Max battery kWh the van could take on its own (0 for an empty window)."""
+    lo, hi = _window(v, n)
+    if v.departure_slot <= v.arrival_slot or hi <= lo:
+        return 0.0
+    return eta * max(0.0, v.max_kw) * (hi - lo) * slot_h
+
+
 def _pre_reason(v: VanIn, n: int, eta: float, slot_h: float) -> str | None:
     """Reasons 1 (window) and 2 (rate), independent of other vans."""
     need = v.need_kwh
@@ -148,13 +181,17 @@ def _label_span(first: int, last: int, labels: list[str] | None, slot_h: float) 
     return f"{start}-{end}"
 
 
-def _site_reason(v: VanIn, short: float, site_load: list[float], site_limit: float,
+def _site_clause(v: VanIn, site_load: list[float], site_limit: float,
                  labels: list[str] | None, slot_h: float) -> str:
+    """'site limit L kW contended HH:MM-HH:MM' for the van's contended slots."""
     lo, hi = _window(v, len(site_load))
     contended = [t for t in range(lo, hi) if site_load[t] >= site_limit - _TOL]
     first, last = (contended[0], contended[-1]) if contended else (lo, hi - 1)
     span = _label_span(first, last, labels, slot_h)
-    return f"site limit {_f(site_limit)} kW contended {span}: short {_f(short)} kWh"
+    return f"site limit {_f(site_limit)} kW contended {span}"
+
+
+_FURTHER_MIN = 0.05  # kWh of extra (site) shortfall before a rate reason mentions it
 
 
 def _results(vans, power, n, eta, slot_h, site_limit, labels):
@@ -167,9 +204,17 @@ def _results(vans, power, n, eta, slot_h, site_limit, labels):
         row = [float(x) for x in power[i]]
         delivered = eta * sum(row) * slot_h
         reason = _pre_reason(v, n, eta, slot_h)
-        short = max(0.0, v.need_kwh) - delivered
-        if reason is None and short > _TOL:
-            reason = _site_reason(v, short, site_load, site_limit, labels, slot_h)
+        need = max(0.0, v.need_kwh)
+        short = need - delivered
+        if reason is None:
+            if short > _TOL:
+                clause = _site_clause(v, site_load, site_limit, labels, slot_h)
+                reason = f"{clause}: short {_f(short)} kWh"
+        elif reason.startswith("needs "):
+            further = short - (need - _rate_cap(v, n, eta, slot_h))
+            if further > _FURTHER_MIN:
+                clause = _site_clause(v, site_load, site_limit, labels, slot_h)
+                reason += f"; {clause}: further short {_f(further)} kWh"
         out.append(VanResult(id=v.id, need_kwh=v.need_kwh, delivered_kwh=delivered,
                              power_kw=row, reason=reason))
     return out, site_load
@@ -233,31 +278,14 @@ def optimise(
 
     power = np.zeros((V, n))
     if P > 0:
-        price_a = np.asarray(prices)
-        penalty = (1e4 + 100.0 * float(np.max(np.abs(price_a)))) / eta if n else 1e4 / eta  # dominates price/eta per battery kWh
-        c = np.concatenate([price_a[pt_a] * slot_h, np.full(V, penalty)])
-
-        idx = np.arange(P)
-        uidx = P + np.arange(V)
-        e = eta * slot_h
-        # Site limit: sum_v p[v,t] <= L                         (n rows)
-        # Need:      -e*sum_t p[v,t] - unmet[v] <= -need[v]     (V rows)
-        # No over:    e*sum_t p[v,t] <= need[v]                 (V rows)
-        rows = np.concatenate([pt_a, n + pv_a, n + V + pv_a, n + np.arange(V)])
-        cols = np.concatenate([idx, idx, idx, uidx])
-        vals = np.concatenate([np.ones(P), np.full(P, -e), np.full(P, e), -np.ones(V)])
-        A = coo_matrix((vals, (rows, cols)), shape=(n + 2 * V, P + V)).tocsr()
         need = np.array([max(0.0, v.need_kwh) for v in vans])
-        b = np.concatenate([np.full(n, site_limit), -need, need])
-        ub = np.concatenate([np.array([vans[i].max_kw for i in pv], dtype=float),
-                             np.full(V, np.inf)])
-        bounds = np.column_stack([np.zeros(P + V), ub])
-
-        res = linprog(c, A_ub=A, b_ub=b, bounds=bounds, method="highs")
-        if res.status != 0:
-            raise RuntimeError(f"charging LP failed: {res.message}")
-        x = res.x[:P]
-        power[pv_a, pt_a] = np.clip(x, 0.0, ub[:P])
+        rate_short = np.array([max(0.0, need[i] - _rate_cap(v, n, eta, slot_h))
+                               for i, v in enumerate(vans)])
+        x = _solve_lexicographic(pv_a, pt_a, np.array([v.max_kw for v in vans], dtype=float),
+                                 need, rate_short, np.asarray(prices), n, eta, slot_h,
+                                 site_limit)
+        ub = np.array([vans[i].max_kw for i in pv], dtype=float)
+        power[pv_a, pt_a] = np.clip(x, 0.0, ub)
 
     results, site_load = _results(vans, power, n, eta, slot_h, site_limit, slot_labels)
     cost, co2 = _cost_carbon(site_load, prices, carbon_g_per_kwh, slot_h)
@@ -270,6 +298,71 @@ def optimise(
     return PlanOut(status=status, vans=results, cost_gbp=cost, carbon_kg=co2,
                    site_load_kw=site_load, baseline=base,
                    baseline_cost_gbp=base_cost, baseline_carbon_kg=base_co2)
+
+
+_REL, _ABS = 1e-7, 1e-6   # slack when fixing a previous stage's optimum
+
+
+def _relax(opt: float) -> float:
+    return opt + _REL * abs(opt) + _ABS
+
+
+def _linprog(c, A, b, bounds):
+    res = linprog(c, A_ub=A, b_ub=b, bounds=bounds, method="highs")
+    if res.status != 0:
+        raise RuntimeError(f"charging LP failed: {res.message}")
+    return res
+
+
+def _solve_lexicographic(pv_a, pt_a, max_kw, need, rate_short, price_a, n, eta,
+                         slot_h, site_limit):
+    """Return p (length P) for the lexicographic objective in the module docstring.
+
+    Variables: p[k] for each plugged-in (van, slot) pair k, then unmet[v] (V), then z.
+    """
+    P, V = len(pv_a), len(need)
+    idx, uidx, zcol = np.arange(P), P + np.arange(V), P + V
+    e = eta * slot_h
+    # Site limit: sum_v p[v,t] <= L                         (n rows)
+    # Need:      -e*sum_t p[v,t] - unmet[v] <= -need[v]     (V rows)
+    # No over:    e*sum_t p[v,t] <= need[v]                 (V rows)
+    rows = np.concatenate([pt_a, n + pv_a, n + V + pv_a, n + np.arange(V)])
+    cols = np.concatenate([idx, idx, idx, uidx])
+    vals = np.concatenate([np.ones(P), np.full(P, -e), np.full(P, e), -np.ones(V)])
+    m0 = n + 2 * V
+    b0 = np.concatenate([np.full(n, site_limit), -need, need])
+    ub = np.concatenate([max_kw[pv_a], np.full(V, np.inf), [0.0]])  # z fixed to 0 in stage 1
+    bounds = np.column_stack([np.zeros(P + V + 1), ub])
+
+    # Stage 1: (a) then (c). The penalty per battery kWh unmet exceeds any
+    # |price|/eta, so no cost saving can ever buy a kWh of unmet.
+    penalty = (1e4 + 100.0 * float(np.max(np.abs(price_a)))) / eta
+    c3 = np.concatenate([price_a[pt_a] * slot_h, np.full(V, penalty), [0.0]])
+    A1 = coo_matrix((vals, (rows, cols)), shape=(m0, P + V + 1)).tocsr()
+    res = _linprog(c3, A1, b0, bounds)
+    unmet_opt = float(res.x[uidx].sum())
+    if unmet_opt <= rate_short.sum() + _ABS:
+        return res.x[:P]  # every van gets all it physically can: (b) = 0 already
+
+    # Stage 2: (b) with (a) fixed.   sum_v unmet[v] <= U*  (1 row)
+    #   unmet[v] - need[v] * z <= rate_short[v]  for need[v] > 0  (fairness rows)
+    fv = np.flatnonzero(need > _TOL)
+    rows2 = np.concatenate([rows, np.full(V, m0), m0 + 1 + np.arange(len(fv)),
+                            m0 + 1 + np.arange(len(fv))])
+    cols2 = np.concatenate([cols, uidx, uidx[fv], np.full(len(fv), zcol)])
+    vals2 = np.concatenate([vals, np.ones(V), np.ones(len(fv)), -need[fv]])
+    A2 = coo_matrix((vals2, (rows2, cols2)), shape=(m0 + 1 + len(fv), P + V + 1)).tocsr()
+    b2 = np.concatenate([b0, [_relax(unmet_opt)], rate_short[fv]])
+    bounds[zcol, 1] = np.inf
+    c2 = np.zeros(P + V + 1)
+    c2[zcol] = 1.0
+    res = _linprog(c2, A2, b2, bounds)
+
+    # Stage 3: (c) with (a) and (b) fixed (penalty kept so unmet is not shaved
+    # up to the tolerance just to save cost).
+    bounds[zcol, 1] = _relax(float(res.x[zcol]))
+    res = _linprog(c3, A2, b2, bounds)
+    return res.x[:P]
 
 
 def baseline(

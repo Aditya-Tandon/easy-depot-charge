@@ -50,7 +50,7 @@ def test_full_flow(client, monkeypatch):
     assert c.post("/prices/refresh").status_code == 200
     assert c.post("/plan").status_code == 200
     r = c.get("/")
-    assert "Optimised cost" in r.text and "revision 1" in r.text
+    assert "Cost tonight" in r.text and "Viewing rev 1" in r.text and "Waiting for you" not in r.text
     with DBSession(engine) as s:
         plan = s.exec(select(Plan)).one()
         assert plan.cost_gbp <= plan.baseline_cost_gbp + 1e-6
@@ -60,11 +60,11 @@ def test_full_flow(client, monkeypatch):
 
     # LLM proposal → pending → accept → session updated
     canned = json.dumps({"proposals": [
-        {"vehicle": "Van 03", "field": "arrival_soc", "value": "20%", "quote": "only 20% left"},
-        {"vehicle": "Van 99", "field": "arrival_soc", "value": "20%", "quote": "only 20% left"},
+        {"vehicle": "Van 03", "field": "arrival_soc", "value": "15%", "quote": "only 15% left"},
+        {"vehicle": "Van 99", "field": "arrival_soc", "value": "15%", "quote": "only 15% left"},
     ]})
     monkeypatch.setattr(llm, "call_runware", lambda *a, **k: canned)
-    c.post("/proposals", data={"text": "Van 03 is back with only 20% left"})
+    c.post("/proposals", data={"text": "Van 03 is back with only 15% left"})
     with DBSession(engine) as s:
         props = s.exec(select(Proposal).order_by(Proposal.id)).all()
         assert [p.status for p in props] == ["pending", "invalid"]
@@ -73,7 +73,7 @@ def test_full_flow(client, monkeypatch):
     with DBSession(engine) as s:
         v3 = s.exec(select(Vehicle).where(Vehicle.name == "Van 03")).one()
         sess = s.exec(select(Session).where(Session.vehicle_id == v3.id)).one()
-        assert sess.arrival_soc == pytest.approx(0.2)
+        assert sess.arrival_soc == pytest.approx(0.15)
         assert s.get(Proposal, pid).status == "accepted"
 
     # re-plan creates revision 2 as a draft

@@ -1,6 +1,8 @@
+import json
 import math
 from datetime import date as Date, datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -21,17 +23,22 @@ def _utc(dt: datetime) -> datetime:
     return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
 
 
-templates.env.filters["local"] = lambda dt, fmt="%H:%M": _utc(dt).astimezone(LONDON).strftime(fmt) if dt else ""
+def _local(dt: datetime | None, fmt: str = "%H:%M") -> str:
+    return _utc(dt).astimezone(LONDON).strftime(fmt) if dt else ""
 
 
 def _isolocal(v: str) -> str:
     try:
-        return _utc(datetime.fromisoformat(v)).astimezone(LONDON).strftime("%a %H:%M")
-    except ValueError:
+        return _local(datetime.fromisoformat(v), "%a %H:%M")
+    except (TypeError, ValueError):
         return v  # invalid rows keep the model's raw value
 
 
-templates.env.filters["isolocal"] = _isolocal
+def _gbp(x: float | None) -> str:
+    return "–" if x is None else ("−£" if x < 0 else "£") + f"{abs(x):,.2f}"
+
+
+templates.env.filters.update(local=_local, isolocal=_isolocal, gbp=_gbp)
 
 
 # ---------- helpers ----------
@@ -44,12 +51,12 @@ def _window(d: Date) -> tuple[datetime, datetime, list[datetime]]:
 
 
 def _sessions(db: DBSession, d: Date) -> list[tuple[Vehicle, Session]]:
-    rows = db.exec(select(Vehicle, Session).join(Session, Session.vehicle_id == Vehicle.id)
-                   .where(Session.date == d).order_by(Session.arrival_at)).all()
+    q = (select(Vehicle, Session).join(Session, Session.vehicle_id == Vehicle.id)
+         .where(Session.date == d).order_by(Session.arrival_at, Vehicle.name))
+    rows = db.exec(q).all()
     if not rows:  # new evening: create tonight's demo sessions on first visit
         seed(d)
-        rows = db.exec(select(Vehicle, Session).join(Session, Session.vehicle_id == Vehicle.id)
-                       .where(Session.date == d).order_by(Session.arrival_at)).all()
+        rows = db.exec(q).all()
     return list(rows)
 
 
@@ -63,45 +70,113 @@ def _prices(db: DBSession, d: Date, refresh: bool = False) -> list[PriceSlot]:
     return list(rows)
 
 
-def _latest_plan(db: DBSession, site_id: int, d: Date) -> Plan | None:
-    return db.exec(select(Plan).where(Plan.site_id == site_id, Plan.date == d)
-                   .order_by(col(Plan.revision).desc())).first()
+def _need(v: Vehicle, s: Session) -> float:
+    return max(0.0, (s.target_soc - s.arrival_soc) * v.battery_kwh)
 
 
-def _redirect() -> RedirectResponse:
-    return RedirectResponse("/", status_code=303)
+def _redirect(msg: str | None = None, anchor: str = "") -> RedirectResponse:
+    url = "/" + (f"?msg={quote(msg)}" if msg else "") + (f"#{anchor}" if anchor else "")
+    return RedirectResponse(url, status_code=303)
+
+
+FIELD_LABEL = {"arrival_at": "Arrival", "departure_at": "Departure",
+               "arrival_soc": "Charge on arrival", "target_soc": "Target charge"}
+
+
+def _fmt_field(field: str | None, value) -> str:
+    if value is None or field is None:
+        return "–"
+    try:
+        if field.endswith("_at"):
+            return _local(value if isinstance(value, datetime) else datetime.fromisoformat(value), "%a %H:%M")
+        return f"{float(value) * 100:.0f}%"
+    except (TypeError, ValueError):
+        return str(value)
 
 
 # ---------- page ----------
 
 @app.get("/", response_class=HTMLResponse)
-def index(request: Request, db: DBSession = Depends(get_db)):
+def index(request: Request, plan: int | None = None, msg: str | None = None, db: DBSession = Depends(get_db)):
     d = tonight()
     rows = _sessions(db, d)
     site = db.exec(select(Site)).first()
     _, _, slots = _window(d)
-    prices = db.exec(select(PriceSlot).where(PriceSlot.start_at >= slots[0], PriceSlot.start_at < slots[-1] + SLOT)
-                     .order_by(PriceSlot.start_at)).all()
-    plan = _latest_plan(db, site.id, d) if site else None
-    published = db.exec(select(Plan).where(Plan.date == d, Plan.status == "published")
-                        .order_by(col(Plan.revision).desc())).first()
-    grid, outcomes = {}, {}
-    if plan:
-        for a in db.exec(select(Allocation).where(Allocation.plan_id == plan.id)):
+    price_rows = db.exec(select(PriceSlot).where(PriceSlot.start_at >= slots[0], PriceSlot.start_at < slots[-1] + SLOT)
+                         .order_by(PriceSlot.start_at)).all()
+    by_start = {_utc(p.start_at): p for p in price_rows}
+    prices = [by_start.get(s) for s in slots]
+
+    plans = db.exec(select(Plan).where(Plan.site_id == site.id, Plan.date == d)
+                    .order_by(col(Plan.revision).desc())).all()
+    selected = next((p for p in plans if p.id == plan), plans[0] if plans else None)
+    published = next((p for p in plans if p.status == "published"), None)
+
+    grid: dict[tuple[int, datetime], float] = {}
+    outcomes: dict[int, VanOutcome] = {}
+    shortfalls: dict[int, int] = {}
+    if plans:
+        for o in db.exec(select(VanOutcome).where(col(VanOutcome.plan_id).in_([p.id for p in plans]))):
+            if o.infeasible_reason:
+                shortfalls[o.plan_id] = shortfalls.get(o.plan_id, 0) + 1
+            if selected and o.plan_id == selected.id:
+                outcomes[o.vehicle_id] = o
+    if selected:
+        for a in db.exec(select(Allocation).where(Allocation.plan_id == selected.id)):
             grid[(a.vehicle_id, _utc(a.slot_start))] = a.kw
-        outcomes = {o.vehicle_id: o for o in db.exec(select(VanOutcome).where(VanOutcome.plan_id == plan.id))}
+
+    # stale = tonight's sessions no longer match what the selected plan was built from
+    stale = bool(selected) and (
+        set(outcomes) != {v.id for v, _ in rows}
+        or any(abs(outcomes[v.id].need_kwh - _need(v, s)) > 0.05 for v, s in rows if v.id in outcomes)
+        or db.exec(select(func.count()).select_from(Proposal).where(
+            Proposal.status == "accepted", Proposal.created_at > selected.created_at)).one() > 0
+    )
+
+    fleet = []
+    for v, s in rows:
+        cells = []
+        for t in slots:
+            kw = grid.get((v.id, t), 0.0)
+            plugged = _utc(s.arrival_at) <= t < _utc(s.departure_at)
+            level = min(4, max(1, math.ceil(4 * kw / v.max_charge_kw - 1e-9))) if kw > 0 else 0
+            cells.append({"kw": kw, "plugged": plugged, "level": level})
+        fleet.append({"v": v, "s": s, "need": _need(v, s), "o": outcomes.get(v.id), "cells": cells})
+
     since = datetime.now(timezone.utc) - timedelta(hours=18)
     proposals = db.exec(select(Proposal).where(Proposal.created_at >= since)
-                        .order_by(col(Proposal.created_at).desc()).limit(20)).all()
+                        .order_by(col(Proposal.created_at).desc()).limit(30)).all()
+    sess_by_vid = {v.id: s for v, s in rows}
     names = {v.id: v.name for v, _ in rows}
-    max_price = max((abs(p.price_p_per_kwh) for p in prices), default=1) or 1
-    max_carbon = max((p.carbon_g_per_kwh or 0 for p in prices), default=1) or 1
-    load = {s: sum(grid.get((v.id, s), 0) for v, _ in rows) for s in slots}
+    prop_view = []
+    for p in proposals:
+        s = sess_by_vid.get(p.vehicle_id)
+        prop_view.append({
+            "p": p, "van": names.get(p.vehicle_id, "–"), "label": FIELD_LABEL.get(p.field or "", p.field or "–"),
+            "before": _fmt_field(p.field, getattr(s, p.field)) if s is not None and p.field in FIELD_LABEL else "–",
+            "after": _fmt_field(p.field, p.value) if p.status != "invalid" else (p.value or "–"),
+        })
+    pending = [x for x in prop_view if x["p"].status == "pending"]
+    history = [x for x in prop_view if x["p"].status != "pending"]
+
+    opt_load = [round(sum(grid.get((v.id, t), 0.0) for v, _ in rows), 2) for t in slots]
+    base_load = json.loads(selected.baseline_load_json) if selected and selected.baseline_load_json else None
+    chart = {
+        "labels": [_local(t) for t in slots],
+        "price": [p.price_p_per_kwh if p else None for p in prices],
+        "carbon": [p.carbon_g_per_kwh if p else None for p in prices],
+        "fallback": [bool(p and p.source != "octopus") for p in prices],
+        "opt": opt_load if selected else None,
+        "base": base_load,
+        "limit": site.site_limit_kw,
+    }
+    fetched = max((_utc(p.fetched_at) for p in price_rows), default=None)
+    n_short = sum(1 for o in outcomes.values() if o.infeasible_reason)
     return templates.TemplateResponse(request, "index.html", dict(
-        site=site, date=d, rows=rows, slots=[_utc(s) for s in slots], prices=prices, plan=plan, published=published,
-        grid=grid, outcomes=outcomes, proposals=proposals, names=names, load=load,
-        max_price=max_price, max_carbon=max_carbon, eta=ETA,
-        n_fallback=sum(p.source != "octopus" for p in prices),
+        site=site, date=d, slots=slots, fleet=fleet, plans=plans, plan=selected, published=published,
+        shortfalls=shortfalls, stale=stale, pending=pending, history=history, chart=chart,
+        n_prices=sum(p is not None for p in prices), n_fallback=sum(chart["fallback"]), fetched=fetched,
+        n_short=n_short, eta=ETA, msg=msg, window=(_local(slots[0]), _local(slots[-1] + SLOT)),
     ))
 
 
@@ -114,8 +189,10 @@ def healthz():
 
 @app.post("/prices/refresh")
 def refresh(db: DBSession = Depends(get_db)):
-    _prices(db, tonight(), refresh=True)
-    return _redirect()
+    rows = _prices(db, tonight(), refresh=True)
+    n_oct = sum(p.source == "octopus" for p in rows)
+    note = "" if n_oct == len(rows) else f" ({len(rows) - n_oct} on fallback prices: Agile not yet published)"
+    return _redirect(f"Prices updated: {n_oct} of {len(rows)} half-hours from Octopus Agile{note}.")
 
 
 @app.post("/plan")
@@ -125,8 +202,7 @@ def make_plan(db: DBSession = Depends(get_db)):
     site = db.exec(select(Site)).first()
     rows = _sessions(db, d)
     start, _, slots = _window(d)
-    price_rows = _prices(db, d)
-    by_start = {_utc(p.start_at): p for p in price_rows}
+    by_start = {_utc(p.start_at): p for p in _prices(db, d)}
     prices = [by_start[s].price_p_per_kwh for s in slots]
     carb = [by_start[s].carbon_g_per_kwh for s in slots]
     known = [c for c in carb if c is not None]
@@ -136,16 +212,16 @@ def make_plan(db: DBSession = Depends(get_db)):
     for v, s in rows:
         arr = math.ceil((_utc(s.arrival_at) - start) / SLOT)    # must be plugged in for the whole slot
         dep = math.floor((_utc(s.departure_at) - start) / SLOT)
-        need = max(0.0, (s.target_soc - s.arrival_soc) * v.battery_kwh)
-        vans.append(VanIn(id=v.id, arrival_slot=arr, departure_slot=dep, need_kwh=need, max_kw=v.max_charge_kw))
-    labels = [s.astimezone(LONDON).strftime("%H:%M") for s in slots] + [(slots[-1] + SLOT).astimezone(LONDON).strftime("%H:%M")]
+        vans.append(VanIn(id=v.id, arrival_slot=arr, departure_slot=dep, need_kwh=_need(v, s), max_kw=v.max_charge_kw))
     out = optimise(vans, prices, site.site_limit_kw, eta=ETA, slot_h=0.5, carbon_g_per_kwh=carbon,
-                   slot_labels=labels[:-1])
+                   slot_labels=[_local(s) for s in slots])
+    base_load = [round(sum(b.power_kw[t] for b in out.baseline), 3) for t in range(len(slots))]
 
     rev = (db.exec(select(func.max(Plan.revision)).where(Plan.site_id == site.id, Plan.date == d)).one() or 0) + 1
     plan = Plan(site_id=site.id, date=d, revision=rev, status="draft", cost_gbp=out.cost_gbp,
                 baseline_cost_gbp=out.baseline_cost_gbp, carbon_kg=out.carbon_kg,
-                baseline_carbon_kg=out.baseline_carbon_kg, created_at=datetime.now(timezone.utc))
+                baseline_carbon_kg=out.baseline_carbon_kg, baseline_load_json=json.dumps(base_load),
+                created_at=datetime.now(timezone.utc))
     db.add(plan)
     db.flush()
     for vr in out.vans:
@@ -155,48 +231,61 @@ def make_plan(db: DBSession = Depends(get_db)):
         db.add(VanOutcome(plan_id=plan.id, vehicle_id=vr.id, need_kwh=vr.need_kwh,
                           delivered_kwh=vr.delivered_kwh, infeasible_reason=vr.reason))
     db.commit()
-    return _redirect()
+    short = sum(1 for vr in out.vans if vr.reason)
+    tail = f" {short} van{'s' if short != 1 else ''} can't reach target, see below." if short else " All vans reach target."
+    return _redirect(f"Draft revision {rev} ready: {_gbp(out.cost_gbp)}, saving {_gbp(out.savings_gbp)} "
+                     f"vs charge-on-arrival.{tail}")
 
 
 @app.post("/plan/{plan_id}/publish")
 def publish(plan_id: int, db: DBSession = Depends(get_db)):
     plan = db.get(Plan, plan_id)
-    if plan:
-        for p in db.exec(select(Plan).where(Plan.date == plan.date, Plan.status == "published")):
-            p.status = "superseded"
-        plan.status = "published"
-        db.commit()
-    return _redirect()
+    if not plan:
+        return _redirect("That plan no longer exists.")
+    for p in db.exec(select(Plan).where(Plan.date == plan.date, Plan.status == "published")):
+        p.status = "superseded"
+    plan.status = "published"
+    db.commit()
+    return _redirect(f"Revision {plan.revision} published as tonight's charging plan.")
 
 
 @app.post("/proposals")
 def create_proposals(text: str = Form(...), db: DBSession = Depends(get_db)):
     from app.llm import propose
     text = text.replace("\x00", "").strip()[:2000]
-    if text:
-        propose(db, text, tonight())
-    return _redirect()
+    if not text:
+        return _redirect("Type an update first.", "updates")
+    rows = propose(db, text, tonight())
+    if not rows:
+        return _redirect("No changes to tonight's vans found in that note.", "updates")
+    ok = sum(r.status == "pending" for r in rows)
+    bad = len(rows) - ok
+    parts = [f"{ok} change{'s' if ok != 1 else ''} to review"] + ([f"{bad} rejected by validation"] if bad else [])
+    return _redirect(", ".join(parts) + ".", "updates")
 
 
 @app.post("/proposals/{pid}/{action}")
 def decide(pid: int, action: str, db: DBSession = Depends(get_db)):
     p = db.get(Proposal, pid)
     if not p or p.status != "pending" or action not in ("accept", "reject"):
-        return _redirect()
+        return _redirect("That change was already handled.", "updates")
     if action == "reject":
         p.status = "rejected"
-    else:
-        s = db.exec(select(Session).where(Session.vehicle_id == p.vehicle_id, Session.date == tonight())).first()
-        if not s:
-            p.status, p.error = "invalid", "no session tonight for this vehicle"
-        else:
-            val = datetime.fromisoformat(p.value) if p.field.endswith("_at") else float(p.value)
-            setattr(s, p.field, val)
-            if _utc(s.arrival_at) >= _utc(s.departure_at) or s.target_soc <= s.arrival_soc:
-                db.rollback()
-                p = db.get(Proposal, pid)
-                p.status, p.error = "invalid", "no longer consistent with tonight's session"
-            else:
-                p.status = "accepted"
+        db.commit()
+        return _redirect("Change rejected.", "updates")
+    s = db.exec(select(Session).where(Session.vehicle_id == p.vehicle_id, Session.date == tonight())).first()
+    if not s:
+        p.status, p.error = "invalid", "no session tonight for this vehicle"
+        db.commit()
+        return _redirect("Couldn't apply: that van has no session tonight.", "updates")
+    val = datetime.fromisoformat(p.value) if p.field.endswith("_at") else float(p.value)
+    setattr(s, p.field, val)
+    if _utc(s.arrival_at) >= _utc(s.departure_at) or s.target_soc <= s.arrival_soc:
+        db.rollback()
+        p = db.get(Proposal, pid)
+        p.status, p.error = "invalid", "no longer consistent with tonight's session"
+        db.commit()
+        return _redirect("Couldn't apply: it conflicts with the van's current session.", "updates")
+    p.status = "accepted"
     db.commit()
-    return _redirect()
+    return _redirect("Change applied. Re-optimise to update the plan.", "updates")

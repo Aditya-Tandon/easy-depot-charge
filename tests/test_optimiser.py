@@ -564,3 +564,317 @@ def test_zero_need_gets_no_power(prices):
     assert plan.baseline[0].reason is None
     assert plan.status == "optimal"
     assert plan.cost_gbp == approx(0.0)
+
+
+# =========================================================================== limitations
+# ---- limitations ----
+# Tests added after the first review: combined rate+site shortfall, fair splitting
+# of scarce energy (lexicographic objective), and reviewer-flagged gaps.
+
+import random  # noqa: E402
+import time  # noqa: E402
+
+
+def further_short_in(reason: str) -> float | None:
+    """Extract W from '...: further short W kWh', or None if the clause is absent."""
+    m = re.search(r"; site limit ([0-9]+\.[0-9]) kW contended (.+?): further short ([0-9]+\.[0-9]) kWh$",
+                  reason)
+    return float(m.group(3)) if m else None
+
+
+# ---- L1. combined rate + site shortfall
+
+
+def test_rate_and_site_limited_reports_further_short():
+    """A van both rate-limited and site-squeezed appends 'further short W kWh' to its rate reason."""
+    # Each van alone: cap = 0.9 * 10 kW * 1.0 h = 9.0 kWh < 20 -> rate short 11.0 kWh.
+    # Site 10 kW < 10 + 10: total grid 10 kW * 1.0 h = 10 kWh -> 9.0 kWh battery for both.
+    # So jointly the vans are short 40 - 9 = 31 kWh, of which 22 is rate and 9 is site.
+    vans = [van(1, 0, 2, need=20.0, max_kw=10.0),
+            van(2, 0, 2, need=20.0, max_kw=10.0)]
+    prices = [5.0, 5.0]
+    plan = optimise(vans, prices, site_limit_kw=10.0, eta=0.9, slot_h=0.5,
+                    slot_labels=["18:00", "18:30"])
+
+    check_invariants(plan, vans, prices, 10.0, 0.9, 0.5)
+    assert sum(r.delivered_kwh for r in plan.vans) == approx(9.0)
+    clauses = 0
+    for v, r in zip(vans, plan.vans):
+        assert r.reason.startswith("needs ")
+        assert short_kwh_in(r.reason) == 11.0          # rate part unchanged
+        w = further_short_in(r.reason)
+        if w is not None:
+            clauses += 1
+            assert "; site limit 10.0 kW contended 18:00-19:00: further short" in r.reason
+        # rate short (exactly 11.0) + further short (1-dp) == actual shortfall
+        assert 11.0 + (w or 0.0) == pytest.approx(v.need_kwh - r.delivered_kwh, abs=0.051)
+    assert clauses >= 1  # 9 kWh of site shortfall must be attributed to someone
+
+
+def test_rate_limited_but_not_site_squeezed_has_no_further_clause():
+    """A rate-limited van with ample site capacity keeps the plain rate reason (no 'further short')."""
+    vans = [van(1, 0, 2, need=20.0, max_kw=10.0)]
+    plan = optimise(vans, [5.0, 5.0], site_limit_kw=100.0, eta=0.9, slot_h=0.5)
+    # delivered = 9.0 = cap -> actual short 11.0 == rate short -> no clause
+    assert plan.vans[0].reason.endswith("short 11.0 kWh")
+    assert "further" not in plan.vans[0].reason
+
+
+# ---- L2. fair split of scarce energy (lexicographic objective)
+
+
+def test_fair_split_identical_vans_one_slot():
+    """Two identical vans in one slot with half the site capacity they need each get the same energy."""
+    # Each needs 4.5 kWh -> 4.5 / (0.9 * 0.5) = 10 kW for the one slot; site gives 10 kW total.
+    # Min-unmet: site full (10 kW -> 4.5 kWh battery). Fair: 5 kW each -> 2.25 kWh each.
+    vans = [van(1, 0, 1, need=4.5, max_kw=10.0),
+            van(2, 0, 1, need=4.5, max_kw=10.0)]
+    prices = [5.0]
+    plan = optimise(vans, prices, site_limit_kw=10.0, eta=0.9, slot_h=0.5)
+
+    check_invariants(plan, vans, prices, 10.0, 0.9, 0.5)
+    a, b = plan.vans
+    assert a.delivered_kwh == approx(2.25)
+    assert b.delivered_kwh == approx(2.25)
+    assert a.power_kw == [approx(5.0)] and b.power_kw == [approx(5.0)]
+    # both short 4.5 - 2.25 = 2.25 -> "short 2.2" or "2.3" ({:.1f} of 2.25); allow either
+    for r in plan.vans:
+        assert r.reason.startswith("site limit")
+        assert short_kwh_in(r.reason) == pytest.approx(2.25, abs=0.051)
+
+
+def test_fair_split_equal_fractional_shortfall_and_total_unchanged():
+    """Vans with different needs end with equal fractional shortfall; total delivered stays at the min-unmet optimum."""
+    # Both plugged in slots 0..1 (1.0 h), max 20 kW (rate-feasible: 0.9*20*1 = 18 >= 9).
+    # Site 10 kW * 1.0 h = 10 kWh grid -> 9.0 kWh battery total = min-unmet optimum.
+    # Need 9 + 4.5 = 13.5 -> unmet 4.5. Equal fraction f: 9f + 4.5f = 4.5 -> f = 1/3.
+    # A delivers 9 * 2/3 = 6.0 kWh, B delivers 4.5 * 2/3 = 3.0 kWh.
+    vans = [van(1, 0, 2, need=9.0, max_kw=20.0),
+            van(2, 0, 2, need=4.5, max_kw=20.0)]
+    prices = [5.0, 7.0]
+    plan = optimise(vans, prices, site_limit_kw=10.0, eta=0.9, slot_h=0.5)
+
+    check_invariants(plan, vans, prices, 10.0, 0.9, 0.5)
+    a, b = plan.vans
+    assert a.delivered_kwh + b.delivered_kwh == approx(9.0)
+    assert a.delivered_kwh == approx(6.0)
+    assert b.delivered_kwh == approx(3.0)
+    assert (9.0 - a.delivered_kwh) / 9.0 == approx((4.5 - b.delivered_kwh) / 4.5)
+    assert plan.site_load_kw == [approx(10.0), approx(10.0)]
+
+
+def test_fairness_does_not_trade_total_energy():
+    """Fairness never reduces total delivered: a van alone in its window still gets everything it can."""
+    # slot_h 1, eta 1, site 10 kW. A: slot 0 only, need 10. B: slots 0..1, need 10.
+    # Min unmet = 0: A takes slot 0 (10 kWh), B takes slot 1 (10 kWh). All met, no reasons.
+    vans = [van(1, 0, 1, need=10.0, max_kw=10.0),
+            van(2, 0, 2, need=10.0, max_kw=10.0)]
+    prices = [1.0, 9.0]  # B would prefer cheap slot 0, but cost is the last priority
+    plan = optimise(vans, prices, site_limit_kw=10.0, eta=1.0, slot_h=1.0)
+
+    check_invariants(plan, vans, prices, 10.0, 1.0, 1.0)
+    assert plan.vans[0].power_kw == [approx(10.0), approx(0.0)]
+    assert plan.vans[1].power_kw == [approx(0.0), approx(10.0)]
+    assert all(r.reason is None for r in plan.vans)
+    # cost = (1 * 10 + 9 * 10) / 100 = 1.00 GBP
+    assert plan.cost_gbp == approx(1.00)
+
+
+def test_fairness_ignores_unavoidable_rate_shortfall():
+    """A rate-limited van does not make the fairness stage vacuous for the others (fraction is site-attributable)."""
+    # slot_h 1, eta 1, one slot, site 10 kW.
+    # C: rate-limited, max 2 kW, need 10 -> cap 2, rate short 8 (80% short no matter what).
+    # A, B: need 8 each, max 10. Site 10 = C 2 + 8 left for A and B (need 16).
+    # Min unmet: site full -> total delivered 10, unmet 26 - 10 = 16 (8 of it is rate).
+    # Site-attributable fractions: C (u_C - 8)/10, A u_A/8, B u_B/8.
+    # Let C get c in [0, 2]; A = B = (10 - c)/2 (symmetric is best for max(A, B)).
+    #   frac_C = (2 - c)/10 (decreasing in c), frac_A = (8 - (10 - c)/2)/8 = (6 + c)/16 (increasing).
+    # At c = 0: max(0.2, 0.375) = 0.375; they would cross only at c < 0 -> optimum c = 0.
+    # Hence A = B = 5.0, C = 0.0 (C's 2 kWh is a site shortfall on top of its 8 kWh rate shortfall).
+    # (With the literal unmet/need metric C is >= 80% short whatever happens, so the
+    #  fairness stage would leave A/B anywhere in [1.6, 8.4].)
+    vans = [van(1, 0, 1, need=8.0, max_kw=10.0),
+            van(2, 0, 1, need=8.0, max_kw=10.0),
+            van(3, 0, 1, need=10.0, max_kw=2.0)]
+    prices = [5.0]
+    plan = optimise(vans, prices, site_limit_kw=10.0, eta=1.0, slot_h=1.0)
+
+    check_invariants(plan, vans, prices, 10.0, 1.0, 1.0)
+    assert plan.vans[0].delivered_kwh == approx(5.0)
+    assert plan.vans[1].delivered_kwh == approx(5.0)
+    assert plan.vans[2].delivered_kwh == approx(0.0)
+    # C: rate short 10 - 2 = 8.0, further short (10 - 0) - 8 = 2.0
+    assert plan.vans[2].reason.startswith("needs 10.0 kWh")
+    assert further_short_in(plan.vans[2].reason) == 2.0
+
+
+def _random_fleet(rng: random.Random, n_vans: int, n_slots: int) -> tuple[list[VanIn], list[float]]:
+    vans = []
+    for i in range(n_vans):
+        a = rng.randrange(0, n_slots - 2)
+        d = rng.randrange(a + 2, n_slots + 1)
+        vans.append(van(i, a, d, need=rng.uniform(5, 60), max_kw=rng.choice([7.0, 11.0, 22.0])))
+    prices = [rng.uniform(-5, 35) for _ in range(n_slots)]
+    return vans, prices
+
+
+@pytest.mark.parametrize("n_vans, n_slots, budget_s", [(8, 28, 0.25), (50, 48, 2.5)])
+def test_solve_time(n_vans, n_slots, budget_s):
+    """Lexicographic solve stays fast (targets 50 ms / 500 ms; asserted at 5x for CI noise)."""
+    rng = random.Random(7)
+    vans, prices = _random_fleet(rng, n_vans, n_slots)
+    limit = 0.1 * sum(v.max_kw for v in vans)  # tight: forces all 3 LP stages (site-attributable shortfall)
+    optimise(vans, prices, site_limit_kw=limit)  # warm-up
+    t0 = time.perf_counter()
+    plan = optimise(vans, prices, site_limit_kw=limit)
+    dt = time.perf_counter() - t0
+    check_invariants(plan, vans, prices, limit, 0.9, 0.5)
+    assert dt < budget_s, f"{n_vans}x{n_slots} took {dt * 1000:.0f} ms"
+
+
+# ---- L3. reviewer-flagged gaps
+
+
+def _two_contending_vans(arrival: int, departure: int) -> list[VanIn]:
+    # Each alone: 0.9 * 10 kW * 1.0 h = 9.0 >= 8 -> feasible; jointly the 10 kW site gives 9.0 < 16.
+    return [van(1, arrival, departure, need=8.0, max_kw=10.0),
+            van(2, arrival, departure, need=8.0, max_kw=10.0)]
+
+
+def test_site_contention_label_exact_span():
+    """Contention over slots 1..2 is labelled from the start of slot 1 to the start of slot 3."""
+    labels = ["18:00", "18:30", "19:00", "19:30"]
+    vans = _two_contending_vans(1, 3)
+    plan = optimise(vans, [5.0] * 4, site_limit_kw=10.0, eta=0.9, slot_h=0.5, slot_labels=labels)
+    # site load [0, 10, 10, 0] -> contended slots 1..2 -> "18:30-19:30"
+    assert plan.site_load_kw == [approx(0.0), approx(10.0), approx(10.0), approx(0.0)]
+    reasons = [r.reason for r in plan.vans if r.reason]
+    assert reasons  # 7 kWh short in total (which van is short is not tested here)
+    for reason in reasons:
+        assert reason.startswith("site limit")
+        assert "contended 18:30-19:30:" in reason
+
+
+def test_site_contention_label_extrapolates_last_slot_end():
+    """Contention ending at the last slot gets an end label extrapolated by slot_h."""
+    labels = ["18:00", "18:30", "19:00", "19:30"]
+    vans = _two_contending_vans(2, 4)
+    plan = optimise(vans, [5.0] * 4, site_limit_kw=10.0, eta=0.9, slot_h=0.5, slot_labels=labels)
+    # contended slots 2..3 -> "19:00" to end of slot 3 = 19:30 + 30 min = "20:00"
+    reasons = [r.reason for r in plan.vans if r.reason]
+    assert reasons
+    for reason in reasons:
+        assert "contended 19:00-20:00:" in reason
+
+
+def test_site_contention_label_single_last_slot_one_hour_slots():
+    """A single contended final slot with slot_h=1.0 extrapolates the end by 60 minutes."""
+    # One slot (slot 3) of 1 h: each van alone 0.9 * 10 * 1 = 9 >= 8; jointly 9 < 16.
+    vans = _two_contending_vans(3, 4)
+    plan = optimise(vans, [5.0] * 4, site_limit_kw=10.0, eta=0.9, slot_h=1.0,
+                    slot_labels=["18:00", "19:00", "20:00", "21:00"])
+    reasons = [r.reason for r in plan.vans if r.reason]
+    assert reasons
+    for reason in reasons:
+        assert "contended 21:00-22:00:" in reason
+
+
+def test_mixed_fleet_feasible_vans_unaffected():
+    """No-window + rate-limited vans don't stop feasible vans from being met (reason None), status partial."""
+    vans = [van(1, 3, 3, need=10.0, max_kw=20.0),     # no window
+            van(2, 0, 2, need=20.0, max_kw=10.0),     # rate: 0.9*10*1.0 = 9 < 20 -> short 11.0
+            van(3, 0, 4, need=9.0, max_kw=11.0),      # 0.9*11*2 = 19.8 >= 9
+            van(4, 1, 4, need=4.5, max_kw=7.0)]       # 0.9*7*1.5 = 9.45 >= 4.5
+    prices = [8.0, 3.0, 1.0, 6.0]
+    plan = optimise(vans, prices, site_limit_kw=50.0, eta=0.9, slot_h=0.5)
+
+    check_invariants(plan, vans, prices, 50.0, 0.9, 0.5)
+    assert plan.vans[0].reason.startswith("no charging window")
+    assert plan.vans[1].reason.startswith("needs ") and "short 11.0 kWh" in plan.vans[1].reason
+    assert "further" not in plan.vans[1].reason
+    assert plan.vans[2].reason is None and plan.vans[2].delivered_kwh == approx(9.0)
+    assert plan.vans[3].reason is None and plan.vans[3].delivered_kwh == approx(4.5)
+    assert plan.status == "partial"
+
+
+def test_need_exactly_at_rate_cap_is_met():
+    """need == eta * max_kw * hours is feasible: reason None."""
+    # cap = 1.0 * 10 kW * (2 * 0.5 h) = 10.0 kWh == need
+    vans = [van(1, 0, 2, need=10.0, max_kw=10.0)]
+    plan = optimise(vans, [5.0, 5.0], site_limit_kw=100.0, eta=1.0, slot_h=0.5)
+    assert plan.vans[0].reason is None
+    assert plan.vans[0].delivered_kwh == approx(10.0)
+    assert plan.status == "optimal"
+
+
+def test_need_just_above_rate_cap_is_short():
+    """need slightly above the cap reports the small rate shortfall."""
+    # cap 10.0; need 10.08 -> short 0.08 -> "{:.1f}" = "0.1" (not a rounding tie); needs "10.1"
+    vans = [van(1, 0, 2, need=10.08, max_kw=10.0)]
+    plan = optimise(vans, [5.0, 5.0], site_limit_kw=100.0, eta=1.0, slot_h=0.5)
+    r = plan.vans[0]
+    assert r.reason.startswith("needs 10.1 kWh")
+    assert r.reason.endswith("short 0.1 kWh")
+    assert r.delivered_kwh == approx(10.0)
+
+
+def test_negative_arrival_clipped_and_rate_hours_from_clipped_window():
+    """arrival_slot < 0 is clipped to 0; the rate reason's hours use the clipped window."""
+    # Window -3..2 clips to slots 0, 1 -> 2 * 0.5 = 1.0 h; cap 0.9 * 10 * 1.0 = 9.0 -> short 11.0
+    vans = [van(1, -3, 2, need=20.0, max_kw=10.0)]
+    prices = [5.0, 5.0, 5.0, 5.0]
+    plan = optimise(vans, prices, site_limit_kw=100.0, eta=0.9, slot_h=0.5)
+
+    check_invariants(plan, vans, prices, 100.0, 0.9, 0.5)
+    r = plan.vans[0]
+    assert "x 1.0 h x" in r.reason
+    assert "= 9.0 kWh -> short 11.0 kWh" in r.reason
+    assert r.power_kw == [approx(10.0), approx(10.0), approx(0.0), approx(0.0)]
+
+
+@pytest.mark.parametrize(
+    "slot_h, departure, need, hours_txt, cap_txt, short_txt",
+    [
+        (1.0, 2, 30.0, "2.0", "18.0", "12.0"),   # 2 slots * 1 h; 0.9*10*2 = 18; 30-18 = 12
+        (0.25, 4, 20.0, "1.0", "9.0", "11.0"),   # 4 slots * 0.25 h; 0.9*10*1 = 9; 20-9 = 11
+    ],
+)
+def test_rate_reason_hours_for_other_slot_lengths(slot_h, departure, need, hours_txt, cap_txt, short_txt):
+    """Rate reason hours = clipped slots * slot_h for slot_h other than 0.5."""
+    vans = [van(1, 0, departure, need=need, max_kw=10.0)]
+    prices = [5.0] * 6
+    plan = optimise(vans, prices, site_limit_kw=100.0, eta=0.9, slot_h=slot_h)
+
+    check_invariants(plan, vans, prices, 100.0, 0.9, slot_h)
+    reason = plan.vans[0].reason
+    assert f"x {hours_txt} h x" in reason
+    assert f"= {cap_txt} kWh -> short {short_txt} kWh" in reason
+
+
+def test_random_instances_properties():
+    """Seeded random fleets: invariants hold; min-unmet beats baseline; cost <= baseline when baseline meets all."""
+    rng = random.Random(20261104)
+    checked_cost = 0
+    for _ in range(50):
+        n = rng.randint(2, 8)
+        slot_h = rng.choice([0.25, 0.5, 1.0])
+        eta = rng.choice([0.85, 0.9, 1.0])
+        vans = []
+        for i in range(rng.randint(1, 4)):
+            a = rng.randint(-2, n - 1)
+            d = a + rng.choice([-1, 0, 1, 2, 3, 4, 6, 8])  # includes empty windows
+            vans.append(van(i, a, d, need=round(rng.uniform(0, 8), 2),
+                            max_kw=rng.choice([0.0, 7.0, 11.0, 22.0, 22.0])))
+        prices = [round(rng.uniform(-5, 35), 2) for _ in range(n)]
+        limit = round(rng.uniform(5, 50), 1)
+        plan = optimise(vans, prices, site_limit_kw=limit, eta=eta, slot_h=slot_h)
+
+        check_invariants(plan, vans, prices, limit, eta, slot_h)
+        total_opt = sum(r.delivered_kwh for r in plan.vans)
+        total_base = sum(r.delivered_kwh for r in plan.baseline)
+        assert total_opt >= total_base - TOL  # (a) min total unmet
+        if all(r.reason is None for r in plan.baseline):
+            checked_cost += 1
+            assert all(r.reason is None for r in plan.vans)
+            assert plan.cost_gbp <= plan.baseline_cost_gbp + 1e-6
+    assert checked_cost >= 5  # the cost property was actually exercised

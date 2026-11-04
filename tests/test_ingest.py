@@ -1,4 +1,5 @@
 """Tests for app.ingest. No real network: every request goes through httpx.MockTransport."""
+import json
 from datetime import date, datetime, timedelta, timezone
 
 import httpx
@@ -88,7 +89,11 @@ def make_client(rates=None, carbon=None, products=(PRODUCTS_PAGE_1, PRODUCTS_PAG
             page = products[1] if url.params.get("page") == "2" else products[0]
             return httpx.Response(200, json=page)
         if url.host == "api.octopus.energy" and url.path.endswith("/standard-unit-rates/"):
-            return httpx.Response(200, json=rates) if rates is not None else httpx.Response(500)
+            if rates is None:
+                return httpx.Response(500)
+            # json.dumps (unlike httpx's json=) lets a test send a bare NaN/Infinity token, as a real body could.
+            return httpx.Response(200, content=json.dumps(rates).encode(),
+                                  headers={"content-type": "application/json"})
         if url.host == "api.carbonintensity.org.uk":
             return httpx.Response(200, json=carbon) if carbon is not None else httpx.Response(500)
         return httpx.Response(404)
@@ -277,3 +282,70 @@ def test_refresh_fallback_replaced_by_octopus_but_not_vice_versa(db):
     assert all(r.source == "octopus" for r in third)
     assert [r.price_p_per_kwh for r in third] == [40.0 + i for i in range(N_SLOTS)]
     assert all(r.carbon_g_per_kwh is not None for r in third)
+
+
+# --------------------------------------------------------------------------- limitations
+
+def test_concurrent_refresh_conflict_is_retried_not_raised(db):
+    """A row inserted by another session between our select and commit is retried, not raised."""
+    other_slot = START + timedelta(minutes=30)
+    real_exec, raced = db.exec, []
+
+    def exec_then_race(stmt, *a, **kw):
+        rows = list(real_exec(stmt, *a, **kw))
+        if not raced:  # first select only: a concurrent refresh lands the same slot right now
+            raced.append(True)
+            with Session(db.get_bind()) as other:
+                other.add(PriceSlot(start_at=other_slot, price_p_per_kwh=1.0, source="fallback",
+                                    source_url="synthetic:agile-like-curve", fetched_at=START))
+                other.commit()
+        return rows
+
+    db.exec = exec_then_race
+    with make_client(rates=_rates(START, N_SLOTS), carbon=_carbon(START, N_SLOTS)) as c:
+        saved = refresh_prices(db, START, END, c)
+    del db.exec
+
+    assert raced
+    rows = db.exec(select(PriceSlot)).all()
+    assert len(rows) == N_SLOTS and len({r.start_at for r in rows}) == N_SLOTS
+    assert len(saved) == N_SLOTS and all(r.id is not None for r in saved)
+    assert [r.start_at for r in saved] == [START + timedelta(minutes=30 * i) for i in range(N_SLOTS)]
+    # the racing fallback row was upgraded in place with the real Octopus price
+    assert saved[1].source == "octopus" and saved[1].price_p_per_kwh == 21.0
+
+
+def test_one_bad_carbon_row_only_drops_that_slot():
+    """A non-numeric forecast blanks only its own slot's carbon, not the whole fetch."""
+    carbon = _carbon(START, N_SLOTS)
+    carbon["data"]["data"][3]["intensity"]["forecast"] = "n/a"  # index 0 is the pre-window row -> slot 2
+    with make_client(rates=_rates(START, N_SLOTS), carbon=carbon) as c:
+        slots = fetch_slots(START, END, c)
+    assert slots[2].carbon_g_per_kwh is None
+    assert [s.carbon_g_per_kwh for i, s in enumerate(slots) if i != 2] == [100 + i for i in range(N_SLOTS) if i != 2]
+
+
+@pytest.mark.parametrize("bad", ["nan", "inf", "-Infinity", float("nan"), float("inf"), "abc", None, True])
+def test_non_finite_or_non_numeric_price_falls_back_for_that_slot(bad):
+    """A nan/inf/non-numeric value_inc_vat is ignored, so only that slot falls back."""
+    rates = _rates(START, N_SLOTS)
+    rates["results"][-1 - 5]["value_inc_vat"] = bad  # newest-first list -> slot 5
+    with make_client(rates=rates, carbon=None) as c:
+        slots = fetch_slots(START, END, c)
+    assert slots[5].source == "fallback" and slots[5].price_p_per_kwh == ingest.fallback_price(slots[5].start_at)
+    assert all(s.source == "octopus" and s.price_p_per_kwh == 20.0 + i for i, s in enumerate(slots) if i != 5)
+
+
+def test_unaligned_rate_only_applies_to_slots_it_fully_covers():
+    """A rate whose valid_from/valid_to are off the half hour never prices a slot it only partly covers."""
+    q = timedelta(minutes=15)
+    rates = {"count": 2, "next": None, "previous": None, "results": [
+        # 18:15-18:45 covers no whole slot -> 18:00 and 18:30 must fall back
+        {"value_inc_vat": 77.0, "valid_from": _z(START + q), "valid_to": _z(START + 3 * q), "payment_method": None},
+        # 19:15-20:30 fully covers 19:30 and 20:00 only (not 19:00, not 20:30)
+        {"value_inc_vat": 5.0, "valid_from": _z(START + 5 * q), "valid_to": _z(START + 10 * q), "payment_method": None},
+    ]}
+    with make_client(rates=rates, carbon=None) as c:
+        slots = fetch_slots(START, START + timedelta(hours=3), c)
+    assert [s.source for s in slots] == ["fallback", "fallback", "fallback", "octopus", "octopus", "fallback"]
+    assert [s.price_p_per_kwh for s in slots[3:5]] == [5.0, 5.0]
