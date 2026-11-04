@@ -18,15 +18,14 @@ from dataclasses import dataclass, field as dc_field
 from datetime import date as Date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Literal
-from zoneinfo import ZoneInfo
 
 import httpx
 from pydantic import BaseModel, ConfigDict, ValidationError
 from sqlmodel import Session as DBSession, select
 
+from app.timeutil import LONDON, to_utc
 from app.models import Proposal, Session, Vehicle
 
-LONDON = ZoneInfo("Europe/London")  # same as app.seed.LONDON (not imported: avoids pulling in app.db)
 
 RUNWARE_URL = "https://api.runware.ai/v1"
 RUNWARE_MODEL = os.environ.get("RUNWARE_MODEL", "google:gemini@3.1-flash-lite")  # benchmarked: p95 1.6s, 100% acc, ~11x cheaper than Sonnet 4.6
@@ -194,10 +193,6 @@ def _resolve_vehicle(name: str, vehicles: list[Vehicle]) -> tuple[Vehicle | None
     return hits[0], None
 
 
-def _utc(dt: datetime) -> datetime:
-    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
-
-
 _HHMM = re.compile(r"^\s*(\d{1,2}):(\d{2})\s*$")
 
 
@@ -286,7 +281,7 @@ class _Running:
 
     @classmethod
     def of(cls, v: Vehicle, s: Session) -> "_Running":
-        return cls(v.name, _utc(s.arrival_at), _utc(s.departure_at), s.arrival_soc, s.target_soc)
+        return cls(v.name, to_utc(s.arrival_at), to_utc(s.departure_at), s.arrival_soc, s.target_soc)
 
     def earlier(self, f: str, shown: str) -> str:
         """Suffix naming the earlier proposal in this note that set field `f`, if any."""
@@ -383,7 +378,7 @@ def parse_and_validate(raw_text: str, llm_output: str, vehicles: list[Vehicle],
 
     `sessions` maps vehicle_id -> that vehicle's Session for the date being planned.
     """
-    now = _utc(now) if now else datetime.now(timezone.utc)
+    now = to_utc(now) if now else datetime.now(timezone.utc)
     try:
         batch = ProposalBatch.model_validate_json(_strip_fences(llm_output))
     except ValidationError as e:

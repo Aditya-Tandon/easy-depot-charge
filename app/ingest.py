@@ -24,22 +24,19 @@ from __future__ import annotations
 
 import logging
 import math
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta
 from typing import Any, Iterable, Optional
-from zoneinfo import ZoneInfo
 
 import httpx
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm.attributes import set_committed_value
 from sqlmodel import Session, select
 
+from app.timeutil import LONDON, SLOT, UTC, to_utc
 from app.models import PriceSlot
 
 log = logging.getLogger(__name__)
 
-UTC = timezone.utc
-LONDON = ZoneInfo("Europe/London")
-SLOT = timedelta(minutes=30)
 TIMEOUT = 10.0
 
 OCTOPUS_BASE = "https://api.octopus.energy/v1"
@@ -55,25 +52,20 @@ _MAX_PAGES = 20
 
 # --------------------------------------------------------------------------- time helpers
 
-def _utc(dt: datetime) -> datetime:
-    """Normalise to tz-aware UTC. Naive values (e.g. read back from SQLite) are taken as UTC."""
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=UTC)
-    return dt.astimezone(UTC)
 
 
 def _parse_ts(s: str) -> datetime:
-    return _utc(datetime.fromisoformat(s.replace("Z", "+00:00")))
+    return to_utc(datetime.fromisoformat(s.replace("Z", "+00:00")))
 
 
 def _floor_slot(dt: datetime) -> datetime:
-    dt = _utc(dt)
+    dt = to_utc(dt)
     return dt.replace(minute=(dt.minute // 30) * 30, second=0, microsecond=0)
 
 
 def _slot_starts(start: datetime, end: datetime) -> list[datetime]:
     """Half-hour slot starts covering [start, end). start is floored to the half hour."""
-    t, end = _floor_slot(start), _utc(end)
+    t, end = _floor_slot(start), to_utc(end)
     out = []
     while t < end:
         out.append(t)
@@ -93,7 +85,7 @@ def _finite_float(v: Any) -> Optional[float]:
 
 
 def _iso_z(dt: datetime) -> str:
-    return _utc(dt).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return to_utc(dt).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def tonight_window(d: date) -> tuple[datetime, datetime]:
@@ -115,7 +107,7 @@ def fallback_price(slot_start: datetime) -> float:
     19:00-22:00  26.0  post-peak shoulder
     22:00-24:00  18.0  late evening
     """
-    h = _utc(slot_start).astimezone(LONDON).hour
+    h = to_utc(slot_start).astimezone(LONDON).hour
     if h < 5:
         return 12.0
     if h < 7:
@@ -173,7 +165,7 @@ def discover_agile_product(client: httpx.Client, now: Optional[datetime] = None)
     (available_to is null or > now). Prefers non-business products, then the newest
     available_from.
     """
-    now = _utc(now or datetime.now(UTC))
+    now = to_utc(now or datetime.now(UTC))
     candidates = []
     for p in _paginate(client, OCTOPUS_PRODUCTS_URL):
         try:
@@ -239,8 +231,8 @@ def _fetch_octopus(client: httpx.Client, slots: list[datetime]) -> tuple[dict[da
 
 def carbon_url(start: datetime, end: datetime) -> str:
     fmt = "%Y-%m-%dT%H:%MZ"
-    return (f"{CARBON_BASE}/regional/intensity/{_utc(start).strftime(fmt)}/"
-            f"{_utc(end).strftime(fmt)}/regionid/{CARBON_REGION_ID}")
+    return (f"{CARBON_BASE}/regional/intensity/{to_utc(start).strftime(fmt)}/"
+            f"{to_utc(end).strftime(fmt)}/regionid/{CARBON_REGION_ID}")
 
 
 def _fetch_carbon(client: httpx.Client, slots: list[datetime]) -> dict[datetime, float]:
@@ -319,7 +311,7 @@ def _normalise_row(row: PriceSlot) -> PriceSlot:
     for attr in ("start_at", "fetched_at"):
         v = getattr(row, attr)
         if v is not None and (v.tzinfo is None or v.utcoffset() != timedelta(0)):
-            set_committed_value(row, attr, _utc(v))
+            set_committed_value(row, attr, to_utc(v))
     return row
 
 
@@ -331,7 +323,7 @@ def _upsert(db: Session, fresh: list[PriceSlot]) -> list[PriceSlot]:
     """
     lo, hi = fresh[0].start_at, fresh[-1].start_at
     existing = {
-        _utc(r.start_at): r
+        to_utc(r.start_at): r
         for r in db.exec(select(PriceSlot).where(PriceSlot.start_at >= lo, PriceSlot.start_at <= hi))
     }
     saved = []

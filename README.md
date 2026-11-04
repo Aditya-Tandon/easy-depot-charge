@@ -93,6 +93,7 @@ app/
   models.py        tables: Site, Vehicle, Session, PriceSlot, Plan, Allocation, VanOutcome, Proposal
   db.py            database engine and env loading
   seed.py          seeds one London depot and tonight's vans
+  timeutil.py      shared time helpers (UTC, London time, half-hour slot)
   templates/       index.html (the single page)
 tests/             pytest tests for optimiser, ingest, LLM checks and the app
 requirements.txt
@@ -106,6 +107,7 @@ Data sources: if Octopus has no price for a slot, a fallback price curve is used
 - **Postcode per site.** Pick the Octopus region from the postcode, and use the Carbon Intensity postcode endpoint, so prices and carbon come from the right region automatically.
 - **Multiple sites.** One page per depot plus a combined view, with a shared fleet.
 - **Routing vans between depots.** Assign each van to the depot that best fits tomorrow's first job, given charger capacity and local prices. This is a joint assignment and charging problem.
+- **Large or changing fleets.** Add, retire and edit vans from the page instead of the seed script, and make the page work for hundreds of vans: search, filters (e.g. only vans that are short or arriving late), grouping, paging, and a compact fleet grid. The optimiser already handles 50 vans x 48 slots in under 20 ms; at larger sizes, check solve time and consider solving per group.
 - **Live charger data.** Use real charger readings instead of planned values, and re-plan during the night.
 - **Logins for several managers**, with a record of who accepted or published what.
 - **Alerts** when the next day's Agile prices are published (Octopus usually publishes the next day's Agile rates in the late afternoon), so the plan can be run straight away.
@@ -117,7 +119,6 @@ These came out of a code-quality review at the end of the build. They are not fi
 - **No login and no CSRF protection.** Every action (refresh prices, optimise, publish, suggest changes, accept or reject) is a plain POST with no auth. Another website could trigger them, and repeated calls spend Runware and price-API quota. There is no rate limit. Fine for a demo; add a login or at least a same-origin check before real use.
 - **Database outages are not handled.** Price and LLM outages are tested and fail safely, but if Neon is down the page returns a server error. There are no tests for it.
 - **Two routes can still error.** `make_plan` in `app/main.py` assumes a site exists and that every half-hour has a price after a refresh (a missing slot raises `KeyError`). Accepting a suggestion converts the stored value without a guard.
-- **Duplicated time helpers.** A UTC helper is defined in `app/main.py`, `app/ingest.py` and `app/llm.py` (with slightly different behaviour), and `LONDON` is defined in `app/ingest.py`, `app/llm.py` and `app/seed.py`. They should live in one module so they cannot drift apart.
 - **`index()` in `app/main.py` does too much.** It runs the queries, works out whether the plan is stale and builds the chart data in one function. Moving that into a separate, testable module would help.
 - **Thin app-level tests.** `tests/test_app.py` has one end-to-end test, and it checks page wording, so copy changes break it. Publishing, rejecting, conflicting accepts and the stale-plan warning are not tested over HTTP. The SQLite fixture is copied across three test files instead of living in a `conftest.py`.
 - **Schema changes are manual.** Tables are created with `create_all`; the `plan.baseline_load_json` column was added by hand with `ALTER TABLE`. There are no migrations.

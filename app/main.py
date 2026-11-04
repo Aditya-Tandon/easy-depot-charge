@@ -11,25 +11,17 @@ from sqlmodel import Session as DBSession, col, func, select
 
 from app.db import get_db
 from app.models import Allocation, Plan, PriceSlot, Proposal, Session, Site, Vehicle, VanOutcome
-from app.seed import LONDON, seed, tonight
+from app.seed import seed, tonight
+from app.timeutil import SLOT, fmt_local, to_utc
 
 app = FastAPI(title="Overnight Charging Planner")
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
-SLOT = timedelta(minutes=30)
 ETA = 0.9
-
-
-def _utc(dt: datetime) -> datetime:
-    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
-
-
-def _local(dt: datetime | None, fmt: str = "%H:%M") -> str:
-    return _utc(dt).astimezone(LONDON).strftime(fmt) if dt else ""
 
 
 def _isolocal(v: str) -> str:
     try:
-        return _local(datetime.fromisoformat(v), "%a %H:%M")
+        return fmt_local(datetime.fromisoformat(v), "%a %H:%M")
     except (TypeError, ValueError):
         return v  # invalid rows keep the model's raw value
 
@@ -38,7 +30,7 @@ def _gbp(x: float | None) -> str:
     return "–" if x is None else ("−£" if x < 0 else "£") + f"{abs(x):,.2f}"
 
 
-templates.env.filters.update(local=_local, isolocal=_isolocal, gbp=_gbp)
+templates.env.filters.update(local=fmt_local, isolocal=_isolocal, gbp=_gbp)
 
 
 # ---------- helpers ----------
@@ -88,7 +80,7 @@ def _fmt_field(field: str | None, value) -> str:
         return "–"
     try:
         if field.endswith("_at"):
-            return _local(value if isinstance(value, datetime) else datetime.fromisoformat(value), "%a %H:%M")
+            return fmt_local(value if isinstance(value, datetime) else datetime.fromisoformat(value), "%a %H:%M")
         return f"{float(value) * 100:.0f}%"
     except (TypeError, ValueError):
         return str(value)
@@ -104,7 +96,7 @@ def index(request: Request, plan: int | None = None, msg: str | None = None, db:
     _, _, slots = _window(d)
     price_rows = db.exec(select(PriceSlot).where(PriceSlot.start_at >= slots[0], PriceSlot.start_at < slots[-1] + SLOT)
                          .order_by(PriceSlot.start_at)).all()
-    by_start = {_utc(p.start_at): p for p in price_rows}
+    by_start = {to_utc(p.start_at): p for p in price_rows}
     prices = [by_start.get(s) for s in slots]
 
     plans = db.exec(select(Plan).where(Plan.site_id == site.id, Plan.date == d)
@@ -123,7 +115,7 @@ def index(request: Request, plan: int | None = None, msg: str | None = None, db:
                 outcomes[o.vehicle_id] = o
     if selected:
         for a in db.exec(select(Allocation).where(Allocation.plan_id == selected.id)):
-            grid[(a.vehicle_id, _utc(a.slot_start))] = a.kw
+            grid[(a.vehicle_id, to_utc(a.slot_start))] = a.kw
 
     # stale = tonight's sessions no longer match what the selected plan was built from
     stale = bool(selected) and (
@@ -138,7 +130,7 @@ def index(request: Request, plan: int | None = None, msg: str | None = None, db:
         cells = []
         for t in slots:
             kw = grid.get((v.id, t), 0.0)
-            plugged = _utc(s.arrival_at) <= t < _utc(s.departure_at)
+            plugged = to_utc(s.arrival_at) <= t < to_utc(s.departure_at)
             level = min(4, max(1, math.ceil(4 * kw / v.max_charge_kw - 1e-9))) if kw > 0 else 0
             cells.append({"kw": kw, "plugged": plugged, "level": level})
         fleet.append({"v": v, "s": s, "need": _need(v, s), "o": outcomes.get(v.id), "cells": cells})
@@ -162,7 +154,7 @@ def index(request: Request, plan: int | None = None, msg: str | None = None, db:
     opt_load = [round(sum(grid.get((v.id, t), 0.0) for v, _ in rows), 2) for t in slots]
     base_load = json.loads(selected.baseline_load_json) if selected and selected.baseline_load_json else None
     chart = {
-        "labels": [_local(t) for t in slots],
+        "labels": [fmt_local(t) for t in slots],
         "price": [p.price_p_per_kwh if p else None for p in prices],
         "carbon": [p.carbon_g_per_kwh if p else None for p in prices],
         "fallback": [bool(p and p.source != "octopus") for p in prices],
@@ -170,13 +162,13 @@ def index(request: Request, plan: int | None = None, msg: str | None = None, db:
         "base": base_load,
         "limit": site.site_limit_kw,
     }
-    fetched = max((_utc(p.fetched_at) for p in price_rows), default=None)
+    fetched = max((to_utc(p.fetched_at) for p in price_rows), default=None)
     n_short = sum(1 for o in outcomes.values() if o.infeasible_reason)
     return templates.TemplateResponse(request, "index.html", dict(
         site=site, date=d, slots=slots, fleet=fleet, plans=plans, plan=selected, published=published,
         shortfalls=shortfalls, stale=stale, pending=pending, history=history, chart=chart,
         n_prices=sum(p is not None for p in prices), n_fallback=sum(chart["fallback"]), fetched=fetched,
-        n_short=n_short, eta=ETA, msg=msg, window=(_local(slots[0]), _local(slots[-1] + SLOT)),
+        n_short=n_short, eta=ETA, msg=msg, window=(fmt_local(slots[0]), fmt_local(slots[-1] + SLOT)),
     ))
 
 
@@ -202,7 +194,7 @@ def make_plan(db: DBSession = Depends(get_db)):
     site = db.exec(select(Site)).first()
     rows = _sessions(db, d)
     start, _, slots = _window(d)
-    by_start = {_utc(p.start_at): p for p in _prices(db, d)}
+    by_start = {to_utc(p.start_at): p for p in _prices(db, d)}
     prices = [by_start[s].price_p_per_kwh for s in slots]
     carb = [by_start[s].carbon_g_per_kwh for s in slots]
     known = [c for c in carb if c is not None]
@@ -210,11 +202,11 @@ def make_plan(db: DBSession = Depends(get_db)):
 
     vans = []
     for v, s in rows:
-        arr = math.ceil((_utc(s.arrival_at) - start) / SLOT)    # must be plugged in for the whole slot
-        dep = math.floor((_utc(s.departure_at) - start) / SLOT)
+        arr = math.ceil((to_utc(s.arrival_at) - start) / SLOT)    # must be plugged in for the whole slot
+        dep = math.floor((to_utc(s.departure_at) - start) / SLOT)
         vans.append(VanIn(id=v.id, arrival_slot=arr, departure_slot=dep, need_kwh=_need(v, s), max_kw=v.max_charge_kw))
     out = optimise(vans, prices, site.site_limit_kw, eta=ETA, slot_h=0.5, carbon_g_per_kwh=carbon,
-                   slot_labels=[_local(s) for s in slots])
+                   slot_labels=[fmt_local(s) for s in slots])
     base_load = [round(sum(b.power_kw[t] for b in out.baseline), 3) for t in range(len(slots))]
 
     rev = (db.exec(select(func.max(Plan.revision)).where(Plan.site_id == site.id, Plan.date == d)).one() or 0) + 1
@@ -280,7 +272,7 @@ def decide(pid: int, action: str, db: DBSession = Depends(get_db)):
         return _redirect("Couldn't apply: that van has no session tonight.", "updates")
     val = datetime.fromisoformat(p.value) if p.field.endswith("_at") else float(p.value)
     setattr(s, p.field, val)
-    if _utc(s.arrival_at) >= _utc(s.departure_at) or s.target_soc <= s.arrival_soc:
+    if to_utc(s.arrival_at) >= to_utc(s.departure_at) or s.target_soc <= s.arrival_soc:
         db.rollback()
         p = db.get(Proposal, pid)
         p.status, p.error = "invalid", "no longer consistent with tonight's session"

@@ -3,14 +3,13 @@
 All datetimes are timezone-aware UTC (timestamptz). Run: python -m app.seed
 """
 from datetime import date as Date, datetime, time, timedelta, timezone
-from zoneinfo import ZoneInfo
 
 from sqlmodel import Session as DBSession, select
 
 from app.db import engine, init_db
+from app.timeutil import LONDON
 from app.models import Session, Site, Vehicle
 
-LONDON = ZoneInfo("Europe/London")
 
 # name, battery_kwh, max_charge_kw, arrive (local, evening), depart (local, next morning), arrival_soc, target_soc
 FLEET = [
